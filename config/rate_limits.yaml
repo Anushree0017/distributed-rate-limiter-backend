@@ -1,0 +1,17 @@
+default:
+  algorithm: FixedWindow
+  params:
+    window_size_ms: 60000
+    max_requests: 100
+
+endpoints:
+  /api/v1/orders:
+    algorithm: TokenBucket
+    params:
+      capacity: 20
+      refill_rate_per_second: 5
+  /api/v1/search:
+    algorithm: SlidingWindowLog
+    params:
+      window_size_ms: 1000
+      max_requests: 10
