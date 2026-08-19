@@ -19,6 +19,9 @@ backend/
 ├── README.md
 └── requirements.txt
 ```
+
+# Phase 1 - Initial setup
+
 ### Architectural decision: 
 This service runs independently outside of the api gateway. So the api gateway would call this service's endpoint to check if a request is allowed before forwarding it.
 
@@ -149,3 +152,11 @@ services/rate_limiter/
 - Create a venv inside the `/backend` directory and install dependencies there. Do not install globally.
 - Update `README.md` with: config file format, how to point the app at a config file, and a curl example
   for each api endpoint in this service.
+
+
+
+
+
+
+
+
