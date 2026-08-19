@@ -1,8 +1,8 @@
 # Rate Limiter Service
 
 A single-server rate limiter FastAPI service. It sits in front of your API gateway: the
-gateway calls this service's endpoints to check whether a `(clientId, endpoint)` request is
-allowed before forwarding it on. Not distributed — all state lives in-process.
+gateway calls this service's endpoints to check whether a request is allowed before
+forwarding it on. Not distributed — all state lives in-process.
 
 ## Architecture
 
@@ -11,12 +11,13 @@ interfaces/base.py                     RateLimiter ABC (single `check(identifier
 services/rate_limiter/                 One class per algorithm (TokenBucket, FixedWindow, ...)
 services/factory.py                    RateLimiterFactory: EndpointConfig -> RateLimiter instance
 services/rate_limiter_service.py       RateLimiterService: the only class the API layer talks to
-model/rate_limiter_config.py           Pydantic config models (YAML shape)
-model/identifier.py                    ClientIdentifier value object
+model/rate_limiter_config.py           Pydantic config models (YAML shape, discriminated union)
+model/identifier.py                    IdentifierType enum + ClientIdentifier value object
 model/rate_limit_result.py             RateLimitResult response contract
 dto/rate_limit_check_request.py        RateLimitCheckRequest — the `/check` request payload
 core/config_loader.py                  YAML -> RateLimiterSettings, loaded once at startup
-core/settings.py                       Reads RATE_LIMIT_CONFIG_PATH from the environment
+core/settings.py                       Reads RATE_LIMIT_CONFIG_PATH / RATE_LIMITER_CLIENT_TTL_SECONDS
+core/ttl_cache.py                      TTLCache — lazy-eviction store for per-client algorithm state
 api/v1/endpoints/rate_limit.py         `POST /check` — the only HTTP endpoint this service exposes
 main.py                                Loads config at startup, builds RateLimiterService, wires routes
 ```
@@ -26,36 +27,61 @@ hot-reload and no distributed coordination (Redis, etc.) — this is intentional
 single-server/single-process.
 
 This service runs independently of the API gateway (it never sees the gateway's actual
-traffic). The gateway calls `POST /api/v1/check` with the caller's `client_id` and the
-`endpoint` it's about to forward to, gets back a `RateLimitResult`, and enforces it itself
-(e.g. returning its own 429 with `Retry-After` when `allowed` is `false`).
+traffic). The gateway calls `POST /api/v1/check` with the target `endpoint` and an `identifier`
+value, gets back a `RateLimitResult`, and enforces it itself (e.g. returning its own 429 with
+`Retry-After` when `allowed` is `false`).
 
 ## Config file format
 
-YAML file with a `default` algorithm (used as a fallback for any endpoint without an explicit
-entry) and a per-endpoint `endpoints` map keyed by request path:
+YAML file with a `default` entry (used as a fallback for any endpoint without an explicit
+entry) and a per-endpoint `endpoints` map keyed by request path. Each entry declares an
+`identifier_type` (which value the Gateway should send for that endpoint) and a `config` block
+— algorithm name + that algorithm's params, validated as one unit:
 
 ```yaml
 default:
-  algorithm: FixedWindow
-  params:
+  identifier_type: client_id
+  config:
+    algorithm: FixedWindow
     window_size_ms: 60000
     max_requests: 100
 
 endpoints:
   /api/v1/orders:
-    algorithm: TokenBucket
-    params:
+    identifier_type: api_key
+    config:
+      algorithm: TokenBucket
       capacity: 20
       refill_rate_per_second: 5
   /api/v1/search:
-    algorithm: SlidingWindowLog
-    params:
+    identifier_type: client_id
+    config:
+      algorithm: SlidingWindowLog
       window_size_ms: 1000
       max_requests: 10
+  /api/v1/public-search:
+    identifier_type: ip_address
+    config:
+      algorithm: FixedWindow
+      window_size_ms: 1000
+      max_requests: 10
+  /api/v1/checkout:
+    identifier_type: api_key
+    config:
+      algorithm: LeakyBucket
+      capacity: 10
+      leak_rate_per_second: 2
+  /api/v1/reports:
+    identifier_type: client_id
+    config:
+      algorithm: SlidingWindowCounter
+      window_size_ms: 60000
+      max_requests: 30
 ```
 
-Supported `algorithm` values and their `params`:
+Supported `identifier_type` values: `client_id`, `api_key`, `ip_address`.
+
+Supported `algorithm` values and their `config` params:
 
 | Algorithm              | Params                                          |
 |-------------------------|--------------------------------------------------|
@@ -65,7 +91,16 @@ Supported `algorithm` values and their `params`:
 | `FixedWindow`           | `window_size_ms` (int), `max_requests` (int)     |
 | `LeakyBucket`           | `capacity` (int), `leak_rate_per_second` (float) |
 
-An invalid or unknown algorithm/params fails fast at startup, not per-request.
+`config` is a Pydantic discriminated union on `algorithm` — every field in the table above is
+required for that algorithm. A missing or malformed param fails config loading immediately with
+a `RateLimiterConfigError` naming the offending endpoint and field, e.g.:
+
+```
+core.config_loader.RateLimiterConfigError: Invalid rate limit config in config/rate_limits.yaml:
+  - endpoints./api/v1/orders.config.TokenBucket.capacity: Field required
+```
+
+The app fails to boot on a config error rather than starting with a broken endpoint.
 
 ## Pointing the app at a config file
 
@@ -74,6 +109,20 @@ Set `RATE_LIMIT_CONFIG_PATH` in `.env` (or the environment) to the YAML file's p
 
 ```
 RATE_LIMIT_CONFIG_PATH=config/rate_limits.yaml
+```
+
+## Per-client state TTL
+
+Each algorithm keeps its per-client state (buckets/windows/logs) in a `TTLCache`
+(`core/ttl_cache.py`) rather than an unbounded `dict`, so a long-running process doesn't
+accumulate memory forever for clients (especially `ip_address`-keyed ones) that stop sending
+traffic. Eviction is lazy — checked on every access — and measured from each key's *last
+access*, so an active client is never evicted mid algorithm-window.
+
+Configurable via `.env` / the environment, defaults to 1 hour:
+
+```
+RATE_LIMITER_CLIENT_TTL_SECONDS=3600
 ```
 
 ## Running
@@ -88,20 +137,41 @@ python3 -m venv venv
 
 ### `POST /api/v1/check`
 
-Body: `{"client_id": "<caller id>", "endpoint": "<endpoint path being requested>"}`.
+Body: `{"endpoint": "<endpoint path being requested>", "identifier": "<caller identifier>"}`.
+`identifier` is a single value — whichever `client_id` / `api_key` / `ip_address` value the
+target endpoint's config declares via `identifier_type`. The Gateway is expected to already know
+which value to send, from the same shared config.
 
-Always returns `200` with a `RateLimitResult` body (`allowed`, `remaining`, `retry_after_ms`) —
-this service reports the decision, it doesn't enforce it. The caller (the API gateway) is
-responsible for rejecting the original request when `allowed` is `false`.
+Always returns `200` with a `RateLimitResult` body — this service reports the decision, it
+doesn't enforce it. The caller (the API gateway) is responsible for rejecting the original
+request when `allowed` is `false`.
 
 ```bash
 curl -i -X POST http://127.0.0.1:8000/api/v1/check \
   -H "Content-Type: application/json" \
-  -d '{"client_id": "alice", "endpoint": "/api/v1/orders"}'
+  -d '{"endpoint": "/api/v1/orders", "identifier": "api-key-abc123"}'
+
+curl -i -X POST http://127.0.0.1:8000/api/v1/check \
+  -H "Content-Type: application/json" \
+  -d '{"endpoint": "/api/v1/public-search", "identifier": "203.0.113.7"}'
 ```
 
 `endpoint` is matched against the YAML config's `endpoints` keys; if there's no entry for it,
-the `default` algorithm is used.
+the `default` algorithm and `identifier_type` are used.
+
+### Response fields -> Gateway header mapping
+
+The response body's field names/units are aligned 1:1 with conventional `X-RateLimit-*` /
+`Retry-After` header practice, so the Gateway's translation from this JSON into headers on the
+real client-facing response is a direct rename — not a re-derivation:
+
+| Response field    | Suggested Gateway header | Unit                          |
+|--------------------|---------------------------|--------------------------------|
+| `allowed`          | (drives 200 vs 429, not itself a header) | boolean |
+| `limit`             | `X-RateLimit-Limit`      | count                          |
+| `remaining`         | `X-RateLimit-Remaining`  | count                          |
+| `reset_at_ms`       | `X-RateLimit-Reset`      | epoch **ms** — convert to seconds if the header convention at your gateway expects seconds |
+| `retry_after_ms`    | `Retry-After`            | **ms** in this response, but `Retry-After` is conventionally **seconds** — the Gateway must divide by 1000 (and round up) before setting the header |
 
 ## Testing
 
@@ -110,5 +180,7 @@ the `default` algorithm is used.
 ```
 
 Covers each algorithm (allow/block/reset behavior via an injectable fake clock), the factory,
-the service (config lookup + default fallback), and an integration test hitting the demo
-endpoint end-to-end via `TestClient`.
+config validation (`test_config_validation.py` — missing/invalid params fail fast with a clear
+message), the TTL cache (`test_ttl_cache.py` — eviction after TTL, active clients surviving past
+what would otherwise be the TTL), the service (config lookup + default fallback), and an
+integration test hitting the demo endpoint end-to-end via `TestClient`.

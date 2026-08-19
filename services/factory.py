@@ -1,7 +1,6 @@
 """Builds a `RateLimiter` implementation from an `EndpointConfig`."""
 from interfaces.base import RateLimiter
 from model.rate_limiter_config import (
-    AlgorithmName,
     EndpointConfig,
     FixedWindowParams,
     LeakyBucketParams,
@@ -15,32 +14,30 @@ from services.rate_limiter.sliding_window_counter import SlidingWindowCounterLim
 from services.rate_limiter.sliding_window_log import SlidingWindowLogLimiter
 from services.rate_limiter.token_bucket import TokenBucketLimiter
 
-_PARAM_MODELS = {
-    AlgorithmName.TOKEN_BUCKET: TokenBucketParams,
-    AlgorithmName.SLIDING_WINDOW_LOG: SlidingWindowLogParams,
-    AlgorithmName.SLIDING_WINDOW_COUNTER: SlidingWindowCounterParams,
-    AlgorithmName.FIXED_WINDOW: FixedWindowParams,
-    AlgorithmName.LEAKY_BUCKET: LeakyBucketParams,
-}
-
-_LIMITER_CLASSES = {
-    AlgorithmName.TOKEN_BUCKET: TokenBucketLimiter,
-    AlgorithmName.SLIDING_WINDOW_LOG: SlidingWindowLogLimiter,
-    AlgorithmName.SLIDING_WINDOW_COUNTER: SlidingWindowCounterLimiter,
-    AlgorithmName.FIXED_WINDOW: FixedWindowLimiter,
-    AlgorithmName.LEAKY_BUCKET: LeakyBucketLimiter,
+_LIMITER_CLASSES: dict[type, type[RateLimiter]] = {
+    TokenBucketParams: TokenBucketLimiter,
+    SlidingWindowLogParams: SlidingWindowLogLimiter,
+    SlidingWindowCounterParams: SlidingWindowCounterLimiter,
+    FixedWindowParams: FixedWindowLimiter,
+    LeakyBucketParams: LeakyBucketLimiter,
 }
 
 
 class RateLimiterFactory:
-    """Instantiates the `RateLimiter` for a given algorithm + params config."""
+    """Instantiates the `RateLimiter` for a given endpoint's algorithm config.
+
+    `EndpointConfig.config` is already a validated, algorithm-specific params
+    model by the time it reaches here (Pydantic's discriminated union in
+    `model/rate_limiter_config.py` guarantees the shape at config-load time),
+    so this only needs to dispatch on its type — no defensive key checks.
+    """
 
     @staticmethod
-    def create(config: EndpointConfig) -> RateLimiter:
-        params_model = _PARAM_MODELS.get(config.algorithm)
-        limiter_cls = _LIMITER_CLASSES.get(config.algorithm)
-        if params_model is None or limiter_cls is None:
-            raise ValueError(f"Unknown rate limiter algorithm: {config.algorithm}")
+    def create(config: EndpointConfig, ttl_seconds: float) -> RateLimiter:
+        params = config.config
+        limiter_cls = _LIMITER_CLASSES.get(type(params))
+        if limiter_cls is None:
+            raise ValueError(f"Unknown rate limiter algorithm params: {type(params).__name__}")
 
-        params = params_model.model_validate(config.params)
-        return limiter_cls(**params.model_dump())
+        kwargs = params.model_dump(exclude={"algorithm"})
+        return limiter_cls(**kwargs, ttl_seconds=ttl_seconds)

@@ -1,17 +1,38 @@
 default:
-  algorithm: FixedWindow
-  params:
+  identifier_type: client_id
+  config:
+    algorithm: FixedWindow
     window_size_ms: 60000
     max_requests: 100
 
 endpoints:
   /api/v1/orders:
-    algorithm: TokenBucket
-    params:
+    identifier_type: api_key
+    config:
+      algorithm: TokenBucket
       capacity: 20
       refill_rate_per_second: 5
   /api/v1/search:
-    algorithm: SlidingWindowLog
-    params:
+    identifier_type: client_id
+    config:
+      algorithm: SlidingWindowLog
       window_size_ms: 1000
       max_requests: 10
+  /api/v1/public-search:
+    identifier_type: ip_address
+    config:
+      algorithm: FixedWindow
+      window_size_ms: 1000
+      max_requests: 10
+  /api/v1/checkout:
+    identifier_type: api_key
+    config:
+      algorithm: LeakyBucket
+      capacity: 10
+      leak_rate_per_second: 2
+  /api/v1/reports:
+    identifier_type: client_id
+    config:
+      algorithm: SlidingWindowCounter
+      window_size_ms: 60000
+      max_requests: 30
