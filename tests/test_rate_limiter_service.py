@@ -1,6 +1,8 @@
 import pytest
 
-from model.identifier import IdentifierType
+from interfaces.base import RateLimiter
+from model.identifier import ClientIdentifier, IdentifierType
+from model.rate_limit_result import RateLimitResult
 from model.rate_limiter_config import EndpointConfig, RateLimiterSettings
 from services.rate_limiter_service import RateLimiterService
 
@@ -49,3 +51,18 @@ async def test_clients_are_isolated_within_an_endpoint():
     result_b = await service.check_rate_limit(endpoint="/api/v1/orders", identifier="b")
     assert result_a.allowed is True
     assert result_b.allowed is True
+
+
+class _ExplodingLimiter(RateLimiter):
+    async def check(self, identifier: ClientIdentifier) -> RateLimitResult:
+        raise RuntimeError("backend unavailable")
+
+
+@pytest.mark.asyncio
+async def test_check_rate_limit_fails_open_on_unexpected_backend_error():
+    service = RateLimiterService(_settings(), ttl_seconds=3600)
+    service._default.limiter = _ExplodingLimiter()
+
+    result = await service.check_rate_limit(endpoint="/api/v1/unknown", identifier="client-1")
+
+    assert result.allowed is True

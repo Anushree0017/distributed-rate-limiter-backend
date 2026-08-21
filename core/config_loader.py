@@ -30,7 +30,9 @@ def load_rate_limiter_settings(path: str | Path) -> RateLimiterSettings:
     try:
         settings = RateLimiterSettings.model_validate(raw_config)
     except ValidationError as exc:
-        raise RateLimiterConfigError(_format_validation_error(config_file, exc)) from exc
+        message = _format_validation_error(config_file, exc)
+        logger.error(message)
+        raise RateLimiterConfigError(message) from exc
 
     logger.info(
         "Loaded rate limit config from %s: default=%s, %d endpoint(s) configured",

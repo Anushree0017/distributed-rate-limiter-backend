@@ -47,3 +47,27 @@ def test_check_rejects_missing_fields():
     with TestClient(app) as client:
         response = client.post("/api/v1/check", json={"identifier": "alice"})
     assert response.status_code == 422
+
+
+def test_health_returns_ok():
+    with TestClient(app) as client:
+        response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_unhandled_exception_returns_generic_500(monkeypatch):
+    async def _boom(self, endpoint, identifier):
+        raise RuntimeError("something exploded")
+
+    monkeypatch.setattr(
+        "services.rate_limiter_service.RateLimiterService.check_rate_limit", _boom
+    )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/v1/check", json={"identifier": "alice", "endpoint": "/api/v1/orders"}
+        )
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal server error"}

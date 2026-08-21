@@ -148,3 +148,16 @@ core/rate_limiter/
   outside a web context.
 - Update `README.md` with: config file format, how to point the app at a config file, and a curl example
   showing a 429 response.
+
+
+## Future work
+
+- Include client authentication
+
+
+
+
+
+
+
+

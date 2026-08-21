@@ -18,8 +18,11 @@ dto/rate_limit_check_request.py        RateLimitCheckRequest — the `/check` re
 core/config_loader.py                  YAML -> RateLimiterSettings, loaded once at startup
 core/settings.py                       Reads RATE_LIMIT_CONFIG_PATH / RATE_LIMITER_CLIENT_TTL_SECONDS
 core/ttl_cache.py                      TTLCache — lazy-eviction store for per-client algorithm state
-api/v1/endpoints/rate_limit.py         `POST /check` — the only HTTP endpoint this service exposes
-main.py                                Loads config at startup, builds RateLimiterService, wires routes
+core/logging.py                        setup_logging() — LOG_LEVEL -> stdlib logging config
+api/v1/endpoints/rate_limit.py         `POST /check` — the rate-limit decision endpoint
+api/health.py                          `GET /health` — liveness check
+main.py                                Loads config at startup, builds RateLimiterService, wires
+                                        routes, registers the global exception handler
 ```
 
 Config is parsed once at FastAPI startup (`lifespan`) and stored on `app.state`. There is no
@@ -133,7 +136,26 @@ python3 -m venv venv
 ./venv/bin/uvicorn main:app --reload
 ```
 
+## Logging
+
+Standard library `logging`, configured once at startup (`core/logging.py`). Level is set via
+`LOG_LEVEL` (default `INFO`):
+
+```
+LOG_LEVEL=DEBUG
+```
+
+- `INFO`: startup milestones (config loaded, endpoints registered) and rate-limit denials.
+- `DEBUG`: every check (allow or deny) and factory instantiation details — noisy, local/dev only.
+- `ERROR`: config validation failures at startup, unexpected backend errors during a check, and
+  any other unhandled exception.
+
 ## API
+
+### `GET /health`
+
+Liveness check — `200 {"status": "ok"}` once the app has booted and its config loaded. No
+dependency checks (no Redis yet); revisit when a distributed backend lands.
 
 ### `POST /api/v1/check`
 
@@ -159,6 +181,14 @@ curl -i -X POST http://127.0.0.1:8000/api/v1/check \
 `endpoint` is matched against the YAML config's `endpoints` keys; if there's no entry for it,
 the `default` algorithm and `identifier_type` are used.
 
+If the configured limiter itself fails unexpectedly while checking (not a possible failure mode
+today — in-memory algorithms don't throw — but relevant once a backend that can time out, e.g.
+Redis, lands), the service **fails open**: it logs the error and returns
+`{"allowed": true, "limit": -1, "remaining": -1}` rather than blocking every client on a backend
+outage. Any other unhandled exception in the request path returns a generic
+`500 {"detail": "Internal server error"}` (see the global exception handler in `main.py`); the
+detail is deliberately non-specific — full context goes to the `ERROR` log instead.
+
 ### Response fields -> Gateway header mapping
 
 The response body's field names/units are aligned 1:1 with conventional `X-RateLimit-*` /
@@ -180,7 +210,9 @@ real client-facing response is a direct rename — not a re-derivation:
 ```
 
 Covers each algorithm (allow/block/reset behavior via an injectable fake clock), the factory,
-config validation (`test_config_validation.py` — missing/invalid params fail fast with a clear
-message), the TTL cache (`test_ttl_cache.py` — eviction after TTL, active clients surviving past
-what would otherwise be the TTL), the service (config lookup + default fallback), and an
-integration test hitting the demo endpoint end-to-end via `TestClient`.
+config validation (`test_config_validation.py` — missing/invalid params and non-positive
+capacity/rate/window/max_requests values all fail fast with a clear message), the TTL cache
+(`test_ttl_cache.py` — eviction after TTL, active clients surviving past what would otherwise be
+the TTL), the service (config lookup + default fallback + fail-open on an unexpected backend
+error), `/health`, and integration tests hitting the demo endpoint (and the global exception
+handler) end-to-end via `TestClient`.

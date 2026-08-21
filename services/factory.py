@@ -1,4 +1,6 @@
 """Builds a `RateLimiter` implementation from an `EndpointConfig`."""
+import logging
+
 from interfaces.base import RateLimiter
 from model.rate_limiter_config import (
     EndpointConfig,
@@ -22,6 +24,8 @@ _LIMITER_CLASSES: dict[type, type[RateLimiter]] = {
     LeakyBucketParams: LeakyBucketLimiter,
 }
 
+logger = logging.getLogger(__name__)
+
 
 class RateLimiterFactory:
     """Instantiates the `RateLimiter` for a given endpoint's algorithm config.
@@ -40,4 +44,5 @@ class RateLimiterFactory:
             raise ValueError(f"Unknown rate limiter algorithm params: {type(params).__name__}")
 
         kwargs = params.model_dump(exclude={"algorithm"})
+        logger.debug("Instantiating %s with params=%s ttl_seconds=%s", limiter_cls.__name__, kwargs, ttl_seconds)
         return limiter_cls(**kwargs, ttl_seconds=ttl_seconds)
