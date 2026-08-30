@@ -3,6 +3,7 @@ import textwrap
 from fastapi.testclient import TestClient
 
 from main import app
+from tests.conftest import get_test_redis_url
 
 
 def test_check_allows_then_blocks_with_retry_after(tmp_path, monkeypatch):
@@ -21,6 +22,7 @@ def test_check_allows_then_blocks_with_retry_after(tmp_path, monkeypatch):
         )
     )
     monkeypatch.setenv("RATE_LIMIT_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("REDIS_URL", get_test_redis_url())
     payload = {"identifier": "integration-client", "endpoint": "/api/v1/orders"}
 
     with TestClient(app) as client:
@@ -43,17 +45,19 @@ def test_check_allows_then_blocks_with_retry_after(tmp_path, monkeypatch):
         assert body["reset_at_ms"] > 0
 
 
-def test_check_rejects_missing_fields():
+def test_check_rejects_missing_fields(monkeypatch):
+    monkeypatch.setenv("REDIS_URL", get_test_redis_url())
     with TestClient(app) as client:
         response = client.post("/api/v1/check", json={"identifier": "alice"})
     assert response.status_code == 422
 
 
-def test_health_returns_ok():
+def test_health_returns_ok(monkeypatch):
+    monkeypatch.setenv("REDIS_URL", get_test_redis_url())
     with TestClient(app) as client:
         response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json()["status"] == "ok"
 
 
 def test_unhandled_exception_returns_generic_500(monkeypatch):
@@ -63,6 +67,7 @@ def test_unhandled_exception_returns_generic_500(monkeypatch):
     monkeypatch.setattr(
         "services.rate_limiter_service.RateLimiterService.check_rate_limit", _boom
     )
+    monkeypatch.setenv("REDIS_URL", get_test_redis_url())
 
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post(

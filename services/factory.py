@@ -1,6 +1,8 @@
 """Builds a `RateLimiter` implementation from an `EndpointConfig`."""
 import logging
 
+from redis.asyncio import Redis
+
 from interfaces.base import RateLimiter
 from model.rate_limiter_config import (
     EndpointConfig,
@@ -34,15 +36,26 @@ class RateLimiterFactory:
     model by the time it reaches here (Pydantic's discriminated union in
     `model/rate_limiter_config.py` guarantees the shape at config-load time),
     so this only needs to dispatch on its type — no defensive key checks.
+
+    `scope` disambiguates Redis keys between endpoints that share the same
+    algorithm + params (including two endpoints that fall back to the same
+    default), so their rate-limit state stays isolated the same way separate
+    in-memory instances kept it isolated pre-Redis. Every algorithm class
+    still only registers its Lua script once for the process lifetime
+    regardless of how many `scope`s use it — that dedup lives in
+    `script_loader.load_script`, not here, so isolation and "register once"
+    aren't in tension (see CLAUDE.md's deviations section for why this
+    differs from the plan's original "cache instances per (algorithm,
+    config)" suggestion).
     """
 
     @staticmethod
-    def create(config: EndpointConfig, ttl_seconds: float) -> RateLimiter:
+    def create(config: EndpointConfig, redis_client: Redis, scope: str) -> RateLimiter:
         params = config.config
         limiter_cls = _LIMITER_CLASSES.get(type(params))
         if limiter_cls is None:
             raise ValueError(f"Unknown rate limiter algorithm params: {type(params).__name__}")
 
         kwargs = params.model_dump(exclude={"algorithm"})
-        logger.debug("Instantiating %s with params=%s ttl_seconds=%s", limiter_cls.__name__, kwargs, ttl_seconds)
-        return limiter_cls(**kwargs, ttl_seconds=ttl_seconds)
+        logger.debug("Instantiating %s scope=%s with params=%s", limiter_cls.__name__, scope, kwargs)
+        return limiter_cls(**kwargs, redis_client=redis_client, scope=scope)

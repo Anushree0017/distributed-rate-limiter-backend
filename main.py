@@ -6,10 +6,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from api.health import router as health_router
-from api.v1.endpoints import rate_limit
+from api.v1.endpoints import rate_limit, redis_health
 from core.config_loader import load_rate_limiter_settings
 from core.logging import setup_logging
-from core.settings import get_client_ttl_seconds, get_rate_limit_config_path
+from core.redis_client import create_redis_pool, get_redis_client, ping
+from core.settings import get_rate_limit_config_path
 from services.rate_limiter_service import RateLimiterService
 
 setup_logging()
@@ -18,8 +19,21 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    redis_pool = create_redis_pool()
+    redis_client = get_redis_client(redis_pool)
+
+    # Hard-fail at boot if Redis is unreachable — distinct from the
+    # steady-state fail-open policy in RateLimiterService, which is meant for
+    # *transient* outages, not "Redis was never configured correctly."
+    if not await ping(redis_client):
+        raise RuntimeError(
+            "Cannot start: Redis is unreachable at boot (PING failed). "
+            "Check REDIS_URL and that Redis is running."
+        )
+
+    app.state.redis_client = redis_client
     settings = load_rate_limiter_settings(get_rate_limit_config_path())
-    app.state.rate_limiter_service = RateLimiterService(settings, get_client_ttl_seconds())
+    app.state.rate_limiter_service = RateLimiterService(settings, redis_client)
     logger.info(
         "Rate limiter service ready: default=%s, %d endpoint(s) configured",
         settings.default.config.algorithm,
@@ -27,9 +41,13 @@ async def lifespan(app: FastAPI):
     )
     yield
 
+    await redis_client.aclose()
+    await redis_pool.disconnect()
+
 
 app = FastAPI(title="Rate Limiter Service", lifespan=lifespan)
 app.include_router(rate_limit.router, prefix="/api/v1")
+app.include_router(redis_health.router, prefix="/api/v1")
 app.include_router(health_router)
 
 

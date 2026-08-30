@@ -4,5 +4,6 @@ pydantic
 PyYAML
 python-dotenv
 httpx
+redis
 pytest
 pytest-asyncio

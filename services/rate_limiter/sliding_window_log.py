@@ -1,59 +1,40 @@
-"""Sliding window log rate limiter — keeps an exact timestamp log per client."""
-import asyncio
-import time
-from collections import deque
-from typing import Callable
+"""Sliding window log rate limiter — keeps an exact timestamp log per client
+in a Redis sorted set. Redis/Lua-backed; see `fixed_window.py` for the shared
+atomicity/error-propagation notes.
+"""
+import uuid
 
-from core.ttl_cache import TTLCache
+from redis.asyncio import Redis
+
 from interfaces.base import RateLimiter
 from model.identifier import ClientIdentifier
 from model.rate_limit_result import RateLimitResult
-
-Clock = Callable[[], float]
-
-_DEFAULT_TTL_SECONDS = 3600.0
+from services.rate_limiter.script_loader import load_script
 
 
 class SlidingWindowLogLimiter(RateLimiter):
-    def __init__(
-        self,
-        window_size_ms: int,
-        max_requests: int,
-        clock: Clock = time.monotonic,
-        ttl_seconds: float = _DEFAULT_TTL_SECONDS,
-    ) -> None:
+    def __init__(self, window_size_ms: int, max_requests: int, redis_client: Redis, scope: str) -> None:
         self._window_size_ms = window_size_ms
         self._max_requests = max_requests
-        self._clock = clock
-        self._logs: TTLCache[deque[int]] = TTLCache(ttl_seconds=ttl_seconds, clock=clock)
-        self._lock = asyncio.Lock()
+        self._redis = redis_client
+        self._scope = scope
+        self._script = load_script(redis_client, "sliding_window_log")
+
+    def _key(self, identifier: ClientIdentifier) -> str:
+        return f"rl:sliding_window_log:{self._scope}:{identifier.key()}"
 
     async def check(self, identifier: ClientIdentifier) -> RateLimitResult:
-        async with self._lock:
-            now_ms = int(self._clock() * 1000)
-            key = identifier.key()
-            log = self._logs.get_or_create(key, factory=deque)
-
-            window_start_ms = now_ms - self._window_size_ms
-            while log and log[0] <= window_start_ms:
-                log.popleft()
-
-            if len(log) < self._max_requests:
-                log.append(now_ms)
-                remaining = self._max_requests - len(log)
-                reset_at_ms = log[0] + self._window_size_ms
-                return RateLimitResult(
-                    allowed=True,
-                    limit=self._max_requests,
-                    remaining=remaining,
-                    reset_at_ms=reset_at_ms,
-                )
-
-            retry_after_ms = max(log[0] + self._window_size_ms - now_ms, 0)
-            return RateLimitResult(
-                allowed=False,
-                limit=self._max_requests,
-                remaining=0,
-                retry_after_ms=retry_after_ms,
-                reset_at_ms=now_ms + retry_after_ms,
-            )
+        # Two requests can land in the same millisecond; a ZSET member must be
+        # unique, and Lua must not generate this itself (guidelines §4).
+        request_id = uuid.uuid4().hex
+        allowed, limit, remaining, retry_after_ms, reset_at_ms = await self._script(
+            keys=[self._key(identifier)],
+            args=[self._window_size_ms, self._max_requests, request_id],
+        )
+        return RateLimitResult(
+            allowed=bool(allowed),
+            limit=limit,
+            remaining=remaining,
+            retry_after_ms=None if retry_after_ms == -1 else retry_after_ms,
+            reset_at_ms=reset_at_ms,
+        )

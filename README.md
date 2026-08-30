@@ -1,33 +1,48 @@
 # Rate Limiter Service
 
-A single-server rate limiter FastAPI service. It sits in front of your API gateway: the
-gateway calls this service's endpoints to check whether a request is allowed before
-forwarding it on. Not distributed — all state lives in-process.
+A rate limiter FastAPI service. It sits in front of your API gateway: the gateway calls this
+service's endpoints to check whether a request is allowed before forwarding it on. State lives
+in Redis (Lua-scripted per algorithm) rather than in-process, so multiple instances of this
+service share one consistent view of every caller's rate-limit state.
 
 ## Architecture
 
 ```
 interfaces/base.py                     RateLimiter ABC (single `check(identifier)` method)
-services/rate_limiter/                 One class per algorithm (TokenBucket, FixedWindow, ...)
+services/rate_limiter/                 One class per algorithm (TokenBucket, FixedWindow, ...),
+                                        each a thin wrapper around a registered Lua script
+services/rate_limiter/scripts/*.lua    The actual check-and-increment logic, one script per
+                                        algorithm — atomic, single round-trip to Redis
+services/rate_limiter/script_loader.py Loads + registers a .lua file's `Script` object once per
+                                        script for the process lifetime
 services/factory.py                    RateLimiterFactory: EndpointConfig -> RateLimiter instance
-services/rate_limiter_service.py       RateLimiterService: the only class the API layer talks to
+services/rate_limiter_service.py       RateLimiterService: the only class the API layer talks to;
+                                        also owns the Redis fail-open/fail-closed policy
 model/rate_limiter_config.py           Pydantic config models (YAML shape, discriminated union)
 model/identifier.py                    IdentifierType enum + ClientIdentifier value object
-model/rate_limit_result.py             RateLimitResult response contract
+model/rate_limit_result.py             RateLimitResult response contract (includes `degraded`)
 dto/rate_limit_check_request.py        RateLimitCheckRequest — the `/check` request payload
 core/config_loader.py                  YAML -> RateLimiterSettings, loaded once at startup
-core/settings.py                       Reads RATE_LIMIT_CONFIG_PATH / RATE_LIMITER_CLIENT_TTL_SECONDS
-core/ttl_cache.py                      TTLCache — lazy-eviction store for per-client algorithm state
+core/settings.py                       Reads RATE_LIMIT_CONFIG_PATH, REDIS_URL, and Redis pool
+                                        tuning env vars
+core/redis_client.py                   Builds the one process-lifetime Redis connection pool;
+                                        `ping()` used by both health endpoints and startup
+core/dependencies.py                   FastAPI DI: `get_rate_limiter_service`, `get_redis`
 core/logging.py                        setup_logging() — LOG_LEVEL -> stdlib logging config
 api/v1/endpoints/rate_limit.py         `POST /check` — the rate-limit decision endpoint
-api/health.py                          `GET /health` — liveness check
-main.py                                Loads config at startup, builds RateLimiterService, wires
-                                        routes, registers the global exception handler
+api/v1/endpoints/redis_health.py       `GET /redis/health` — Redis diagnostics (memory, evictions,
+                                        maxmemory-policy, ...) for humans/dashboards, not probes
+api/health.py                          `GET /health` — liveness + a single Redis PING
+main.py                                Builds the Redis pool (hard-fails boot if unreachable),
+                                        loads config, builds RateLimiterService, wires routes,
+                                        registers the global exception handler
 ```
 
-Config is parsed once at FastAPI startup (`lifespan`) and stored on `app.state`. There is no
-hot-reload and no distributed coordination (Redis, etc.) — this is intentionally
-single-server/single-process.
+Config is parsed once at FastAPI startup (`lifespan`) and stored on `app.state`, same as the
+Redis connection pool. There is no hot-reload. Rate-limit *decisions* are made by this one
+process at a time per request, but the *state* they're computed from lives in Redis, so this
+service can run as multiple instances/workers pointed at the same Redis without them stepping on
+each other's counters.
 
 This service runs independently of the API gateway (it never sees the gateway's actual
 traffic). The gateway calls `POST /api/v1/check` with the target `endpoint` and an `identifier`
@@ -114,25 +129,77 @@ Set `RATE_LIMIT_CONFIG_PATH` in `.env` (or the environment) to the YAML file's p
 RATE_LIMIT_CONFIG_PATH=config/rate_limits.yaml
 ```
 
-## Per-client state TTL
+## Redis
 
-Each algorithm keeps its per-client state (buckets/windows/logs) in a `TTLCache`
-(`core/ttl_cache.py`) rather than an unbounded `dict`, so a long-running process doesn't
-accumulate memory forever for clients (especially `ip_address`-keyed ones) that stop sending
-traffic. Eviction is lazy — checked on every access — and measured from each key's *last
-access*, so an active client is never evicted mid algorithm-window.
+Every algorithm's check-and-increment runs as a single Lua script against Redis
+(`services/rate_limiter/scripts/*.lua`) — atomic, no Python-side locking, no distributed lock.
+See `.claude/context/redis_guidelines.md` for the full set of conventions this codebase follows
+for any future Redis-touching change.
 
-Configurable via `.env` / the environment, defaults to 1 hour:
+### Running Redis locally
+
+```bash
+docker compose up -d redis
+```
+
+This starts `redis:7-alpine` on `localhost:6379` with `maxmemory-policy noeviction` (so rate-limit
+keys are never evicted early under memory pressure — see redis_guidelines.md §8).
+
+### Required env vars
 
 ```
-RATE_LIMITER_CLIENT_TTL_SECONDS=3600
+REDIS_URL=redis://localhost:6379/0
 ```
+
+Optional pool tuning (sane defaults if unset):
+
+```
+REDIS_MAX_CONNECTIONS=20
+REDIS_SOCKET_TIMEOUT_SECONDS=2.0
+REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS=2.0
+```
+
+The app **fails to boot** if Redis is unreachable at startup (a single `PING`, checked before the
+app starts serving) — distinct from the steady-state fail-open behavior below, which is for
+*transient* outages, not "Redis was never configured."
+
+### Key naming and TTL
+
+Every key is named `rl:{algorithm}:{scope}:{identifier_type}:{identifier_value}`, where `scope`
+is the endpoint path the limiter was configured for (or `__default__` for the fallback limiter) —
+this is what keeps two endpoints sharing an identical algorithm+config from pooling the same
+rate-limit state, mirroring how separate in-memory instances kept them isolated before Redis.
+Predictable and greppable via `redis-cli`, e.g.:
+
+```bash
+redis-cli KEYS 'rl:token_bucket:/api/v1/orders:*'
+```
+
+Every key's TTL is set inside the same Lua script that writes it, sized to that algorithm's own
+semantics (e.g. a token bucket's TTL is however long a full refill from empty would take) — an
+idle key expires at roughly the point it would be indistinguishable from a fresh one. There is no
+separate generic "client TTL" setting to configure.
+
+### Fail-open / fail-closed policy
+
+Decided once, centrally, in `RateLimiterService.check_rate_limit`:
+
+- A Redis connection failure or timeout is treated as a **transient outage**: the service fails
+  open, returning `{"allowed": true, "limit": -1, "remaining": -1, "degraded": true}` rather than
+  blocking every client's traffic because this advisory service couldn't render a decision.
+  `degraded: true` is how a caller tells "genuinely allowed" apart from "allowed because Redis was
+  down" — worth surfacing to the Gateway/caller if it wants to react differently (e.g. skip
+  setting `X-RateLimit-*` headers, or log/alert on it).
+- A Lua runtime error (`ResponseError` — a bug in a script, or a `KEYS`/`ARGV` mismatch) is *not*
+  treated as an outage. It propagates to the global exception handler and returns a generic `500`,
+  since silently failing open there would mask a real bug.
 
 ## Running
 
 ```bash
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
+docker compose up -d redis
 ./venv/bin/uvicorn main:app --reload
 ```
 
@@ -154,8 +221,20 @@ LOG_LEVEL=DEBUG
 
 ### `GET /health`
 
-Liveness check — `200 {"status": "ok"}` once the app has booted and its config loaded. No
-dependency checks (no Redis yet); revisit when a distributed backend lands.
+Liveness check — `200 {"status": "ok", "redis_connected": true}` once the app has booted and its
+config loaded. `redis_connected` is a single `PING` (sub-millisecond) — kept cheap since this is
+likely polled frequently by orchestration tooling (load balancer / k8s probes).
+
+### `GET /api/v1/redis/health`
+
+Heavier Redis diagnostics — memory usage, connected clients, evicted/expired key counts, the
+configured `maxmemory-policy`, and replication `role`. Meant for humans/dashboards checking in
+(during an incident, or while load-testing `sliding_window_log`'s hot-key path), not for
+automated polling on a tight interval — use `/health` for that.
+
+```bash
+curl -s http://127.0.0.1:8000/api/v1/redis/health
+```
 
 ### `POST /api/v1/check`
 
@@ -181,11 +260,8 @@ curl -i -X POST http://127.0.0.1:8000/api/v1/check \
 `endpoint` is matched against the YAML config's `endpoints` keys; if there's no entry for it,
 the `default` algorithm and `identifier_type` are used.
 
-If the configured limiter itself fails unexpectedly while checking (not a possible failure mode
-today — in-memory algorithms don't throw — but relevant once a backend that can time out, e.g.
-Redis, lands), the service **fails open**: it logs the error and returns
-`{"allowed": true, "limit": -1, "remaining": -1}` rather than blocking every client on a backend
-outage. Any other unhandled exception in the request path returns a generic
+See "Fail-open / fail-closed policy" above for what happens when Redis itself is the problem.
+Any other unhandled exception in the request path returns a generic
 `500 {"detail": "Internal server error"}` (see the global exception handler in `main.py`); the
 detail is deliberately non-specific — full context goes to the `ERROR` log instead.
 
@@ -202,17 +278,31 @@ real client-facing response is a direct rename — not a re-derivation:
 | `remaining`         | `X-RateLimit-Remaining`  | count                          |
 | `reset_at_ms`       | `X-RateLimit-Reset`      | epoch **ms** — convert to seconds if the header convention at your gateway expects seconds |
 | `retry_after_ms`    | `Retry-After`            | **ms** in this response, but `Retry-After` is conventionally **seconds** — the Gateway must divide by 1000 (and round up) before setting the header |
+| `degraded`          | (not a standard header — surface it however your Gateway distinguishes a real allow from a fail-open one, e.g. its own diagnostic header or a log field) | boolean |
 
 ## Testing
 
+Every algorithm's check-and-increment is a Lua script that calls `redis.call("TIME")`, and
+`fakeredis`'s `EVAL`/`TIME` fidelity is too incomplete to trust for that (see
+`redis_guidelines.md` §11) — so **all** Redis-touching tests here run against a real,
+already-running local Redis rather than a fake:
+
 ```bash
+docker compose up -d redis
 ./venv/bin/pytest
 ```
 
-Covers each algorithm (allow/block/reset behavior via an injectable fake clock), the factory,
-config validation (`test_config_validation.py` — missing/invalid params and non-positive
-capacity/rate/window/max_requests values all fail fast with a clear message), the TTL cache
-(`test_ttl_cache.py` — eviction after TTL, active clients surviving past what would otherwise be
-the TTL), the service (config lookup + default fallback + fail-open on an unexpected backend
-error), `/health`, and integration tests hitting the demo endpoint (and the global exception
-handler) end-to-end via `TestClient`.
+Tests use database 15 by default (`TEST_REDIS_URL`, separate from `REDIS_URL`'s db 0) and flush it
+before/after each test — point `TEST_REDIS_URL` elsewhere if that doesn't fit your setup.
+
+Covers each algorithm (allow/block/refill-or-leak/reset behavior against real elapsed time, a TTL
+assertion, and a concurrency test firing 30 simultaneous requests at one identifier to prove the
+Lua script's atomicity — not just single-call correctness), raw `EVAL`-based tests per script
+(`test_lua_scripts.py`, bypassing the Python wrapper classes, isolating Lua bugs from integration
+bugs), the factory (including that two endpoints sharing an algorithm+config stay
+isolated while still sharing one `register_script()` call), config validation
+(`test_config_validation.py` — missing/invalid params and non-positive
+capacity/rate/window/max_requests values all fail fast with a clear message), the service
+(config lookup + default fallback + fail-open-with-`degraded` on a Redis connection error +
+propagation of a Lua `ResponseError`), `/health`, `/api/v1/redis/health`, and integration tests
+hitting the demo endpoint (and the global exception handler) end-to-end via `TestClient`.
