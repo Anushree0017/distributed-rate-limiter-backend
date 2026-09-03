@@ -13,3 +13,7 @@ class RateLimitResult(BaseModel):
     remaining: int
     retry_after_ms: int | None = None
     reset_at_ms: int | None = None
+    # `True` only when `allowed=True` because Redis was unreachable (a
+    # fail-open decision), not because the request was genuinely under limit
+    # — see `RateLimiterService.check_rate_limit`.
+    degraded: bool = False
