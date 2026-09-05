@@ -5,5 +5,8 @@ PyYAML
 python-dotenv
 httpx
 redis
+sqlalchemy[asyncio]>=2.0
+asyncpg
+alembic
 pytest
 pytest-asyncio

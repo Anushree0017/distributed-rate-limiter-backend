@@ -306,3 +306,91 @@ capacity/rate/window/max_requests values all fail fast with a clear message), th
 (config lookup + default fallback + fail-open-with-`degraded` on a Redis connection error +
 propagation of a Lua `ResponseError`), `/health`, `/api/v1/redis/health`, and integration tests
 hitting the demo endpoint (and the global exception handler) end-to-end via `TestClient`.
+
+Rules-CRUD tests need a real Postgres too (same "no fakes/testcontainers" philosophy — see
+`.claude/context/redis_guidelines.md`'s reasoning, which this follows equally for Postgres):
+
+```bash
+docker compose up -d redis postgres
+./venv/bin/pytest
+```
+
+They use a `rate_limiter_test` database by default (`TEST_DATABASE_URL`, separate from
+`DATABASE_URL`'s dev database) — create it once if it doesn't exist:
+
+```bash
+docker exec <postgres-container> psql -U postgres -c "CREATE DATABASE rate_limiter_test;"
+```
+
+`tests/conftest.py` runs `alembic upgrade head` against it once per test session and truncates
+`rules`/`rule_history` after every test (`algorithms` is left seeded).
+
+## Rules CRUD API (rate-limiting rule management)
+
+A separate, Postgres-backed API for defining and auditing per-endpoint rate-limiting rules —
+independent of the `/check` decision path above, which still reads its config from
+`config/rate_limits.yaml`. See `.claude/plans/phase3/` for the original design docs (`plan.md`,
+`db_schema.sql`, `api-endpoints.md`) and `CLAUDE.md`'s Phase 3 section for how the implementation
+deviated from them.
+
+### Setup
+
+```bash
+docker compose up -d postgres
+./venv/bin/alembic upgrade head
+```
+
+`DATABASE_URL` in `.env` (defaults to
+`postgresql+asyncpg://postgres:postgres@localhost:5432/rate_limiter`) points the app and Alembic
+at the same database. Migrations create `algorithms` (pre-seeded with `TokenBucket`,
+`FixedWindow`, `SlidingWindowLog`, `SlidingWindowCounter`, `LeakyBucket`), `rules`, and
+`rule_history` (an append-only audit log, populated purely by a DB trigger — nothing in the app
+writes to it directly).
+
+### Endpoints (base path `/api/v1`)
+
+| Method & path              | Purpose |
+|-----------------------------|---------|
+| `GET /rules`                 | List rules, filterable by `endpoint`, `identifier_type`, `status`, `algorithm_id`; paginated (`page`, `page_size`, max 100) |
+| `GET /rules/{id}`             | Fetch one rule |
+| `POST /rules`                 | Create a rule (`status` defaults to `active`, `version` to `1`) |
+| `PATCH /rules/{id}`           | Partial update (`params`, `priority`, `status`, `identifier_value`, `algorithm_id`); `expected_version` enables optimistic concurrency |
+| `DELETE /rules/{id}`          | Hard-delete; the final state is preserved in `rule_history` |
+| `GET /rules/identifiers`      | Static list of the 17 supported `identifier_type` values, for UI dropdowns |
+| `GET /algorithms`             | List available algorithms + their `param_schema` |
+
+```bash
+curl -s http://127.0.0.1:8000/api/v1/algorithms
+
+curl -s -X POST http://127.0.0.1:8000/api/v1/rules \
+  -H "Content-Type: application/json" \
+  -d '{
+    "endpoint": "/checkout",
+    "identifier_type": "user_id",
+    "identifier_value": "user-42",
+    "algorithm_id": "<uuid from /algorithms>",
+    "params": {"limit": 100, "window_seconds": 60},
+    "created_by": "jane.doe"
+  }'
+```
+
+`identifier_value` is required unless `identifier_type` is `"global"`. Only one **active** rule
+can exist per `(endpoint, identifier_type, identifier_value)` scope — enforced by a partial unique
+index in Postgres (`ux_rules_active_scope`) and pre-checked in the service layer for a specific
+error message; a deactivated/deleted rule never blocks a new active one in the same scope.
+
+### Error envelope
+
+All 4xx/5xx responses from the rules-CRUD endpoints use:
+
+```json
+{"error": {"code": "SCOPE_CONFLICT", "message": "...", "details": {...}}}
+```
+
+| `code`                | Status | When |
+|------------------------|--------|------|
+| `RULE_NOT_FOUND`        | 404    | Unknown rule id |
+| `ALGORITHM_NOT_FOUND`   | 422    | Unknown `algorithm_id` on create/update |
+| `VERSION_CONFLICT`      | 409    | `expected_version` doesn't match the current row |
+| `SCOPE_CONFLICT`        | 409    | An active rule already exists for the same scope |
+| `VALIDATION_ERROR`      | 422    | Malformed request body (bad enum value, missing required field, etc.) |

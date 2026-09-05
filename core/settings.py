@@ -10,6 +10,7 @@ _DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 _DEFAULT_REDIS_MAX_CONNECTIONS = 20
 _DEFAULT_REDIS_SOCKET_TIMEOUT_SECONDS = 2.0
 _DEFAULT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = 2.0
+_DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/rate_limiter"
 
 
 def get_rate_limit_config_path() -> str:
@@ -43,3 +44,11 @@ def get_redis_socket_connect_timeout_seconds() -> float:
     return float(
         os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS", _DEFAULT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS)
     )
+
+
+def get_database_url() -> str:
+    """`postgresql+asyncpg://[user[:password]@]host:port/dbname` — the
+    rules-CRUD service's Postgres connection string. Never log this value
+    verbatim if it carries credentials.
+    """
+    return os.getenv("DATABASE_URL", _DEFAULT_DATABASE_URL)

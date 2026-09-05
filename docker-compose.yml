@@ -4,3 +4,17 @@ services:
     ports:
       - "6379:6379"
     command: ["redis-server", "--maxmemory-policy", "noeviction"]
+
+  postgres:
+    image: postgres:18
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: rate_limiter
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

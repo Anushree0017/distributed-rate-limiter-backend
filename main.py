@@ -6,8 +6,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from api.health import router as health_router
-from api.v1.endpoints import rate_limit, redis_health
+from api.v1.endpoints import algorithms, rate_limit, redis_health, rules
 from core.config_loader import load_rate_limiter_settings
+from core.db import dispose_engine
+from core.exceptions import register_exception_handlers
 from core.logging import setup_logging
 from core.redis_client import create_redis_pool, get_redis_client, ping
 from core.settings import get_rate_limit_config_path
@@ -43,12 +45,16 @@ async def lifespan(app: FastAPI):
 
     await redis_client.aclose()
     await redis_pool.disconnect()
+    await dispose_engine()
 
 
 app = FastAPI(title="Rate Limiter Service", lifespan=lifespan)
 app.include_router(rate_limit.router, prefix="/api/v1")
 app.include_router(redis_health.router, prefix="/api/v1")
+app.include_router(rules.router, prefix="/api/v1")
+app.include_router(algorithms.router, prefix="/api/v1")
 app.include_router(health_router)
+register_exception_handlers(app)
 
 
 @app.exception_handler(Exception)
