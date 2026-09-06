@@ -74,6 +74,7 @@ def get_test_database_url() -> str:
 
 @pytest.fixture(scope="session", autouse=True)
 def _run_migrations():
+    import asyncio
     import sys
 
     subprocess.run(
@@ -81,6 +82,54 @@ def _run_migrations():
         check=True,
         env={**os.environ, "DATABASE_URL": get_test_database_url()},
     )
+
+    # Data-only seed migrations (e.g. 0005_seed_sample_rules) are for real
+    # environments — the test suite wants an empty `rules` table to start
+    # from. `algorithms` is left seeded (reference data the tests rely on).
+    async def _clear_rules():
+        engine = create_async_engine(get_test_database_url())
+        async with engine.connect() as conn:
+            await conn.execute(text("TRUNCATE rule_history, rules RESTART IDENTITY CASCADE"))
+            await conn.commit()
+        await engine.dispose()
+
+    asyncio.run(_clear_rules())
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _point_every_test_at_the_scratch_database():
+    """`main.py`'s lifespan now loads the rules cache from `DATABASE_URL` on
+    *every* app boot (Phase 3 Part 2), not just in rules-CRUD-specific test
+    files — so every test that boots the app via `TestClient` (test_health.py,
+    test_integration.py, ...) needs `DATABASE_URL` pointed at the scratch
+    database too, not just the dev one. Session-scoped so it's set before any
+    test module imports/boots the app.
+    """
+    original = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = get_test_database_url()
+    try:
+        yield
+    finally:
+        if original is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = original
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _fresh_db_engine_per_test():
+    """`core/db.py` caches its engine/session-factory at module scope, bound
+    to whichever event loop created them — but each test gets its own event
+    loop via `pytest-asyncio`. Force a fresh engine every test so an
+    asyncpg connection is never reused across event loops.
+    """
+    import core.db
+
+    core.db._engine = None
+    core.db._session_factory = None
+    yield
+    core.db._engine = None
+    core.db._session_factory = None
 
 
 @pytest_asyncio.fixture

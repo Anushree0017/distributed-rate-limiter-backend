@@ -3,29 +3,24 @@
 required at startup even though these endpoints don't touch it) against the
 scratch Postgres database from `tests/conftest.py`.
 """
-import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-import core.db
 from main import app
 from tests.conftest import get_test_database_url, get_test_redis_url
 
+# `DATABASE_URL` -> scratch DB and per-test engine freshness are handled by
+# conftest.py's session-wide autouse fixtures now (needed by every test that
+# boots the app, not just this file). This file only needs REDIS_URL set and
+# `rules`/`rule_history` truncated between tests.
+
 
 @pytest_asyncio.fixture(autouse=True)
-async def _point_app_at_test_db(monkeypatch):
-    monkeypatch.setenv("DATABASE_URL", get_test_database_url())
+async def _point_app_at_test_redis_and_clean_up(monkeypatch):
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
-    # The engine/session factory are cached at module scope (core/db.py) and
-    # bound to whichever event loop created them; each test gets its own
-    # event loop via pytest-asyncio, so force a fresh engine every test.
-    core.db._engine = None
-    core.db._session_factory = None
     yield
-    core.db._engine = None
-    core.db._session_factory = None
 
     engine = create_async_engine(get_test_database_url())
     async with engine.connect() as conn:

@@ -13,19 +13,28 @@
 Phase 1 (core rate limiter), Improvisation 1 (multi-identifier, strict config validation, TTL
 eviction, standardized response fields), Improvisation 2 (non-positive config value validation,
 `/health`, a global exception handler, and app-wide logging), **Phase 2 (Redis + Lua
-integration)**, and **Phase 3 (rules CRUD service)** are all **fully implemented**. Rate-limit
-state still lives in Redis for the `/check` decision path — every algorithm's check-and-increment
-runs as a single atomic Lua script — rather than in an in-process cache, so this service can run
-as multiple instances/workers against one Redis without their counters diverging. Phase 3 adds a
-second, independent persistence layer: a Postgres-backed CRUD API (`/api/v1/rules`,
-`/api/v1/algorithms`) for operators to define and audit per-endpoint rate-limiting rules. **The
-two are not wired together yet** — `RateLimiterService` still reads its config from
-`config/rate_limits.yaml` via `core/config_loader.py`; nothing in the `/check` path queries the
-`rules` table. See `README.md` for the user-facing config format, running instructions, and API
-docs — don't duplicate that here. Any future change that touches Redis, Lua, or the fail-open
-policy should also read `.claude/context/redis_guidelines.md`, which Phase 2 was built against and
-which still governs how such changes are made. Any future change to the rules-CRUD layer should
-read `.claude/plans/phase3/plan.md`, `db_schema.sql`, and `api-endpoints.md`, which Phase 3 was
+integration)**, **Phase 3 (rules CRUD service)**, and **Phase 3 Part 2 (rules cache + polling,
+wired into `/check`)** are all **fully implemented**. Rate-limit state still lives in Redis for
+the `/check` decision path — every algorithm's check-and-increment runs as a single atomic Lua
+script — rather than in an in-process cache, so this service can run as multiple instances/workers
+against one Redis without their counters diverging. Phase 3 added a Postgres-backed CRUD API
+(`/api/v1/rules`, `/api/v1/algorithms`) for operators to define and audit per-endpoint
+rate-limiting rules. **Phase 3 Part 2 wires the two together**: at startup the app loads every
+rule from Postgres into an in-process `RulesCache` (`services/rules_cache.py`) and keeps it in
+sync via a polling background task (`services/rules_loader.py`, default 60s). `RateLimiterService`
+now consults that cache per request — a DB rule matching the request's (endpoint, identifier_value)
+scope wins, then a `global`-scoped rule for the endpoint, then the static
+`config/default_rate_limits.yml` config as fallback. The request path never touches Postgres
+directly. The `IdentifierType` actually used to build the Redis key is likewise sourced from the
+cache (the matched rule's `identifier_type`, mapped via `_RULE_TO_ENGINE_IDENTIFIER_TYPE`) or from
+the static config's `default.identifier_type` on any fallback path — never hardcoded. See the
+"Deviations from the Phase 3 Part 2 plan" section for the exact mapping.
+See `README.md` for the user-facing config format, running instructions, and API docs — don't
+duplicate that here. Any future change that touches Redis, Lua, or the fail-open policy should
+also read `.claude/context/redis_guidelines.md`, which Phase 2 was built against and which still
+governs how such changes are made. Any future change to the rules-CRUD layer should read
+`.claude/plans/phase3/plan.md`, `db_schema.sql`, `api-endpoints.md`, and `plan-part2.md`, which
+Phase 3 was
 built against (with the deviations noted below).
 
 ## Architecture as built
@@ -49,7 +58,9 @@ services/rate_limiter_service.py       RateLimiterService — the only class the
                                         policy is decided (see its docstring)
 model/rate_limiter_config.py           Pydantic config models; AlgorithmConfig is a discriminated
                                         union on `algorithm`, keyed by Literal type
-model/identifier.py                    IdentifierType enum + ClientIdentifier value object
+model/identifier.py                    IdentifierType enum (16 members — one per RuleIdentifierType
+                                        value the rules-CRUD layer can scope to, except `global`,
+                                        which maps to ENDPOINT) + ClientIdentifier value object
                                         (.key() = "{type}:{value}", used as part of the Redis key)
 model/rate_limit_result.py             RateLimitResult: allowed, limit, remaining, retry_after_ms,
                                         reset_at_ms, degraded (true only when `allowed=True`
@@ -77,10 +88,12 @@ api/health.py                          GET /health — liveness + a single Redis
                                         (redis_connected: bool); kept cheap for tight-interval
                                         polling, unlike /redis/health
 main.py                                Calls setup_logging(), builds the Redis pool and hard-fails
-                                        boot if PING fails, loads config, builds
-                                        RateLimiterService, stores both on app.state, wires all
-                                        routers, registers exception handlers, closes the Redis
-                                        pool and disposes the DB engine on shutdown
+                                        boot if PING fails, loads config, loads the RulesCache
+                                        from Postgres (hard-fails boot if that fetch raises),
+                                        builds RateLimiterService with that cache, starts the
+                                        rules poll task, stores everything on app.state, wires all
+                                        routers, registers exception handlers; on shutdown cancels
+                                        the poll task, closes the Redis pool, disposes the DB engine
 
 --- Phase 3 (rules CRUD service) ---
 model/algorithm.py, model/rule.py,     SQLAlchemy ORM models, 1:1 with the `algorithms`/`rules`/
@@ -90,9 +103,12 @@ model/rule_history.py                  `rule_history` tables in db_schema.sql (s
 model/rule_status.py                   RuleStatus(str, Enum): active, inactive
 model/rule_identifier_type.py          RuleIdentifierType(str, Enum), 17 members — the identifier
                                         types a *rule* can scope to (api-endpoints.md's
-                                        `GET /rules/identifiers`). Distinct from and unrelated to
-                                        `model/identifier.py`'s `IdentifierType`, which is the much
-                                        smaller enum the runtime `/check` path uses
+                                        `GET /rules/identifiers`). A distinct enum from
+                                        `model/identifier.py`'s `IdentifierType` (the runtime
+                                        `/check` vocabulary), bridged explicitly via
+                                        `services/rate_limiter_service.py`'s
+                                        `_RULE_TO_ENGINE_IDENTIFIER_TYPE` — not the same enum, but
+                                        every value here does have a runtime mapping
 core/db.py                             Base (declarative), get_engine()/get_session_factory()
                                         (lazy singletons, mirroring core/redis_client.py's "one
                                         pool for the process" pattern), get_db() FastAPI dependency,
@@ -126,9 +142,38 @@ api/v1/endpoints/algorithms.py         `GET /algorithms`
 alembic/                               0001 create algorithms -> 0002 seed algorithms -> 0003
                                         create rules (+ux_rules_active_scope, indexes,
                                         touch-updated_at trigger) -> 0004 create rule_history
-                                        (+audit trigger). `env.py` pulls the URL from
+                                        (+audit trigger) -> 0005 seed sample rules (10 demo rows,
+                                        `created_by='seed_migration'`; the test suite truncates
+                                        these at session start). `env.py` pulls the URL from
                                         core.settings.get_database_url() and imports every model
                                         for autogenerate
+
+--- Phase 3 Part 2 (rules cache + polling into /check) ---
+services/rules_cache.py                RulesCache — storage-agnostic in-memory hold of all rules,
+                                        keyed by id + a secondary (endpoint, identifier_type,
+                                        identifier_value) lookup index (active rules only).
+                                        `load_all` swaps both maps atomically under a
+                                        threading.Lock; reads are lock-free. `upsert`/`remove`
+                                        exist for a future LISTEN/NOTIFY path — nothing calls them
+                                        yet
+services/rules_loader.py               fetch_all_rules_from_db() (reuses
+                                        RuleRepository.list_all(), serializes to plain dicts) +
+                                        run_poll_loop() (the background task: full replace each
+                                        cycle, never crashes the app, never clears the cache on a
+                                        failed cycle, re-raises CancelledError)
+services/rule_algorithm_mapper.py      build_algorithm_config() — bridges the CRUD param
+                                        vocabulary (`limit`, `window_seconds`, `refill_rate`,
+                                        `leak_rate`) to the engine's `*Params` field names
+                                        (`max_requests`, `window_size_ms`, ...). `initial_tokens`
+                                        is accepted but ignored (engine has no such knob)
+services/rate_limiter_service.py       `_resolve_limiter()` precedence: DB rule for the exact
+                                        identifier -> `global` rule for the endpoint -> static
+                                        YAML config. An unusable rule (bad algorithm/params) logs
+                                        and falls back rather than failing the request. Redis
+                                        scope for a rule-derived limiter is `rule:{rule_id}` so
+                                        its state is stable across polls and isolated from YAML
+core/settings.get_rules_poll_interval_seconds()  Reads RULES_POLL_INTERVAL_SECONDS (default 60)
+core/dependencies.get_rules_cache()    Pulls app.state.rules_cache (for a future debug endpoint)
 ```
 
 ### Deviations from the original Phase 1/Improvisation spec worth knowing about
@@ -211,13 +256,14 @@ alembic/                               0001 create algorithms -> 0002 seed algor
   (`tests/conftest.py`'s `redis_client` fixture, database 15 by default via `TEST_REDIS_URL`) —
   `fakeredis` wasn't used anywhere, since every algorithm here is Lua/`TIME()`-heavy and
   `fakeredis`'s fidelity there is explicitly called out as unreliable in the guidelines. Every
-  Redis-touching test in this repo therefore requires a real, already-running Redis
-  (`docker compose up -d redis`) — there is no fast/fake-backed unit test tier for the algorithms.
+  Redis-touching test in this repo therefore requires a real, already-running local Redis —
+  there is no fast/fake-backed unit test tier for the algorithms.
 - **No `testcontainers`/CI-managed ephemeral Redis** — a project decision made explicitly during
-  Phase 2 planning: the developer starts/stops Redis themselves via `docker-compose.yml` rather
-  than tests spinning up their own container. If CI is added later, it needs a Redis service
-  provisioned the same way (a `redis` service alongside the test job), not a testcontainers
-  dependency added to `requirements.txt`.
+  Phase 2 planning: the developer starts/stops Redis themselves (a local/native install, not a
+  container — this project does not run Redis/Postgres via Docker; see the "Running the service"
+  section) rather than tests spinning up their own container. If CI is added later, it needs a
+  Redis service provisioned somehow (e.g. a `redis` service alongside the test job), not a
+  testcontainers dependency added to `requirements.txt`.
 - Exception handling: `RateLimiterService.check_rate_limit`'s try/except got *narrower*, not
   wider, in this phase. It now only catches `redis.exceptions.ConnectionError` /
   `redis.exceptions.TimeoutError` (fail open, `degraded=True`) — a Lua `ResponseError` is left to
@@ -257,33 +303,87 @@ alembic/                               0001 create algorithms -> 0002 seed algor
   also kept as-is) — the two reference docs disagreed on this name, so the mapping is done
   explicitly in `api/v1/endpoints/algorithms.py` rather than relying on Pydantic's
   `from_attributes` to paper over the mismatch.
-- **`/check` (the runtime rate-limit decision endpoint) does not read from the `rules` table.**
-  Phase 3 only builds the CRUD/audit layer for operators to manage rule definitions; wiring
-  `RateLimiterService` to load its config from Postgres instead of (or in addition to)
-  `config/rate_limits.yaml` is unbuilt future work, not a Phase 3 deliverable.
+- **Phase 3 (Part 1) built the CRUD/audit layer only; `/check` did not consult the `rules`
+  table.** That gap was closed by **Phase 3 Part 2** (rules cache + polling — see its own section
+  below): `/check` now resolves against an in-memory `RulesCache` populated from Postgres, still
+  never touching the DB on the request path.
 - **No `testcontainers`/CI-managed ephemeral Postgres**, same project decision as Phase 2's Redis
-  testing approach: a real, already-running Postgres (`docker compose up -d postgres`) rather than
-  a fake or spun-up-per-test-run container. `tests/conftest.py`'s `db_session` fixture runs
+  testing approach: a real, already-running local Postgres (not a container — see the "Running the
+  service" section) rather than a fake or spun-up-per-test-run container. `tests/conftest.py`'s
+  `db_session` fixture runs
   Alembic migrations once per test session against `TEST_DATABASE_URL` (defaults to a
   `rate_limiter_test` database) and truncates `rules`/`rule_history` after each test;
   `algorithms` is left alone since it's seeded reference data, not per-test state.
 
+### Deviations from the Phase 3 Part 2 (rules cache + polling) plan worth knowing about
+- **`RulesCache` uses a `threading.Lock`, not `asyncio.Lock`** — the plan left this to
+  "confirm based on how the middleware calls into this." The plan's own required interface is
+  synchronous (`def load_all`, not `async def`), and every write is a quick non-blocking
+  reference swap, so a plain lock is correct and keeps callers from needing `await cache.load_all(...)`.
+- **The lookup index holds only `status == "active"` rules.** `get(rule_id)` still returns
+  inactive ones (for debug/audit), but `get_by_lookup_key` — the rate limiter's path — skips
+  them, so a deactivated rule stops affecting `/check` at the next poll without needing a
+  delete.
+- **Rule resolution precedence in `RateLimiterService._resolve_limiter`** (the plan said this was
+  "already decided from earlier design discussion" — it wasn't, so this is the decision):
+  exact-identifier DB rule → `global`-scoped DB rule for that endpoint → static
+  `config/default_rate_limits.yml`'s single `default` limiter (there is no per-endpoint YAML
+  config anymore — `RateLimiterSettings` only has a `default` field). There is **no** "cache not
+  ready" fallback on the request path — startup guarantees readiness before traffic.
+- **Two identifier-type vocabularies are bridged in `rate_limiter_service.py`** via
+  `_RULE_TO_ENGINE_IDENTIFIER_TYPE`, an explicit dict exhaustive over every `RuleIdentifierType`
+  value (17 members) mapped to a runtime `IdentifierType` member. `IdentifierType` was extended
+  from its original 4 members (`client_id`, `api_key`, `ip_address`, `endpoint`) to 16 to give
+  every rule-scopable identifier type a runtime equivalent — so any rule an operator creates via
+  `POST /api/v1/rules`, regardless of `identifier_type`, is enforceable at `/check`. Two mappings
+  are non-trivial: `RuleIdentifierType.IP` (`"ip"`) → `IdentifierType.IP_ADDRESS` (different
+  spelling) and `RuleIdentifierType.GLOBAL` (`"global"`) → `IdentifierType.ENDPOINT` (a
+  `global`-scoped rule has no real caller attribute to key on, same rationale as the static
+  fallback). `_resolve_limiter()` returns `tuple[RateLimiter, IdentifierType]` — the resolved type
+  (from the matched rule, or `self._default.identifier_type` on every fallback path) is what
+  `check_rate_limit()` uses to build the `ClientIdentifier` that becomes the Redis key; it does
+  **not** default to `IdentifierType.ENDPOINT` regardless of the match, which was a real bug fixed
+  alongside this bridge (previously `client_identifier` was hardcoded to `ENDPOINT` unconditionally,
+  so every rule's declared `identifier_type` was silently ignored on the actual Redis key). An
+  unrecognized `identifier_type` on a matched rule (stale data from a since-removed
+  `RuleIdentifierType` member — not possible with current data) is treated like an unusable
+  algorithm/params: log and fall back, never fail the request.
+- **A rule-derived limiter's Redis scope is `rule:{rule_id}`**, stable across polls (the rule's
+  UUID doesn't change when its params do) and distinct from the YAML config's scopes
+  (`__default__` / the endpoint path). Changing a rule's params keeps its existing window/bucket
+  state rather than resetting it — same-key continuity, matching how a YAML config edit + reload
+  would behave.
+- **`initial_tokens` (a `TokenBucket` rule param) is accepted but not applied** — the engine's
+  `TokenBucketLimiter`/`token_bucket.lua` always start a bucket full at `capacity`. Documented in
+  `services/rule_algorithm_mapper.py`; revisit only if that engine limitation is lifted.
+- **Every test now boots the app against the scratch DB.** `main.py`'s lifespan loads the rules
+  cache from `DATABASE_URL` on *every* boot, so `tests/conftest.py` gained two session-wide
+  autouse fixtures: one points `DATABASE_URL` at the test database for the whole run, the other
+  resets `core.db`'s cached engine before/after each test (each test has its own event loop; an
+  asyncpg engine can't be shared across loops).
+
 ## Running the service
+
+This project does not run its dependencies via Docker (there is a `docker-compose.yml` in the
+repo, but it is not the supported workflow yet) — Redis and Postgres are expected to already be
+running locally (e.g. native/Homebrew installs) and reachable at their default localhost ports.
 
 ```bash
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
-docker compose up -d redis postgres
 ./venv/bin/alembic upgrade head
 ./venv/bin/uvicorn main:app --reload
 ```
 
 Point it at a config file via `RATE_LIMIT_CONFIG_PATH` in `.env` (defaults to
-`config/rate_limits.yaml`, relative to `backend/`). Point it at Redis via `REDIS_URL` in `.env`
+`config/default_rate_limits.yml`, relative to `backend/`). Point it at Redis via `REDIS_URL` in `.env`
 (defaults to `redis://localhost:6379/0`) — the app **will not start** if Redis is unreachable at
 boot. Point it at Postgres via `DATABASE_URL` in `.env` (defaults to
 `postgresql+asyncpg://postgres:postgres@localhost:5432/rate_limiter`) — run
 `./venv/bin/alembic upgrade head` against it before first boot (the app does not auto-migrate).
+The app **will not start** if the initial load of all rules from Postgres into `RulesCache`
+fails. Tune how often the cache re-polls Postgres via `RULES_POLL_INTERVAL_SECONDS` in `.env`
+(default `60`) — this is the bound on how stale a rule change can be before `/check` sees it.
 Set `LOG_LEVEL=DEBUG` to see per-request check details; default `INFO` only logs startup +
 denials. Then hit an endpoint:
 
@@ -315,13 +415,19 @@ fail-open/fail-closed policy, and the response-field -> gateway-header mapping.
 - Config validation beyond Pydantic shape/type/range checks (`Field(gt=0)` etc. — already
   fail-fast; nothing more elaborate like cross-endpoint or business-rule validation)
 - CI pipeline / testcontainers-managed Redis or Postgres for tests (see deviations above) —
-  currently a manual `docker compose up -d redis postgres` step, by explicit project decision
-- Wiring `/check` to read rule definitions from the `rules` table instead of
-  `config/rate_limits.yaml` — Phase 3 built the CRUD/audit layer only; the runtime decision path
-  is untouched
+  currently a manual "start your local Redis/Postgres" step (not Docker), by explicit project
+  decision
+- Postgres LISTEN/NOTIFY / push-based cache invalidation — Phase 3 Part 2 is polling-only by
+  explicit plan decision. `RulesCache.upsert`/`remove` exist as the seam for it but nothing wires
+  them yet; don't build toward it now.
+- Any LRU/TTL eviction on `RulesCache` — the full rule set lives in memory; there's nothing for
+  an eviction policy to do (see `plan-part2.md`'s "why a plain in-memory cache" section).
+- Distributed/shared rules cache (Redis/Memcached) — each app instance keeps its own in-process
+  copy; only revisit if that stops being viable.
 - `params`/`param_schema` JSON-Schema validation (validating `rules.params` against
   `algorithms.params` server-side) — both columns exist but nothing enforces the relationship yet
-  (see plan.md's open questions)
+  (see plan.md's open questions). Until then, `RateLimiterService` treats a rule whose params
+  don't fit its algorithm as "unusable" and falls back to static config.
 
 This service can now run as **multiple instances/workers** sharing one Redis without their
 counters diverging — that's the point of this phase. The API gateway is still the one enforcing
@@ -330,13 +436,15 @@ the 429/headers on real traffic; this service only reports a decision.
 ## Working conventions for this project
 - Venv lives at `backend/venv`; install deps there (`./venv/bin/pip install -r requirements.txt`),
   never globally.
-- Tests: `docker compose up -d redis postgres`, then `./venv/bin/pytest` from `backend/`. Every
-  Redis-touching test needs that real Redis running — there is no fake-backed fast path (see
-  deviations above for why). Don't reintroduce an injectable clock in algorithm code; time comes
-  from Redis's own `TIME()` inside each Lua script, per `redis_guidelines.md` §4. Every
-  Postgres-touching test needs a `rate_limiter_test` database to exist (`docker exec <postgres
-  container> psql -U postgres -c "CREATE DATABASE rate_limiter_test;"` once) — `tests/conftest.py`
-  runs migrations against it automatically each test session.
+- Tests: make sure your local Redis and Postgres are running (native/Homebrew installs on
+  localhost — this project does not containerize its dependencies yet, despite the
+  `docker-compose.yml` in the repo), then `./venv/bin/pytest` from `backend/`. Every Redis-touching
+  test needs that real Redis running — there is no fake-backed fast path (see deviations above for
+  why). Don't reintroduce an injectable clock in algorithm code; time comes from Redis's own
+  `TIME()` inside each Lua script, per `redis_guidelines.md` §4. Every Postgres-touching test needs
+  a `rate_limiter_test` database to exist (`psql -U postgres -c "CREATE DATABASE
+  rate_limiter_test;"` once) — `tests/conftest.py` runs migrations against it automatically each
+  test session.
 - Rules-CRUD layering is `controller -> service -> repository -> model`, strictly: controllers
   (`api/v1/endpoints/rules.py`, `algorithms.py`) never touch the DB session or ORM models directly;
   services (`services/rule_service.py`, `algorithm_service.py`) own business rules and never build

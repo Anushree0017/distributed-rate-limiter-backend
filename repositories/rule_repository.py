@@ -70,6 +70,17 @@ class RuleRepository:
         await self._session.delete(rule)
         await self._session.commit()
 
+    async def list_all(self) -> list[Rule]:
+        """Every row, unpaginated, algorithm eager-loaded — used by
+        `services/rules_loader.py` to populate `RulesCache` at startup and on
+        each poll cycle. Deliberately separate from `list()` (which is
+        paginated/filtered for the `GET /rules` endpoint) rather than calling
+        it with an oversized `page_size`, so the cache-loading path can never
+        silently truncate at whatever `page_size` cap the API enforces.
+        """
+        result = await self._session.execute(select(Rule).options(selectinload(Rule.algorithm)))
+        return list(result.scalars().all())
+
     async def list(self, filters: RuleFilter) -> tuple[list[Rule], int]:
         stmt = select(Rule).options(selectinload(Rule.algorithm))
         count_stmt = select(func.count()).select_from(Rule)

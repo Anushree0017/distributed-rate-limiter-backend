@@ -7,25 +7,43 @@ from model.identifier import ClientIdentifier, IdentifierType
 from model.rate_limit_result import RateLimitResult
 from model.rate_limiter_config import EndpointConfig, RateLimiterSettings
 from services.rate_limiter_service import RateLimiterService
+from services.rules_cache import RulesCache
 
 
 def _settings() -> RateLimiterSettings:
     return RateLimiterSettings(
         default=EndpointConfig(
-            identifier_type=IdentifierType.CLIENT_ID,
+            identifier_type=IdentifierType.ENDPOINT,
             config={"algorithm": "FixedWindow", "window_size_ms": 1000, "max_requests": 1},
         ),
-        endpoints={
-            "/api/v1/orders": EndpointConfig(
-                identifier_type=IdentifierType.API_KEY,
-                config={"algorithm": "TokenBucket", "capacity": 1, "refill_rate_per_second": 1},
-            ),
-        },
     )
 
 
-async def test_uses_configured_limiter_for_known_endpoint(redis_client):
-    service = RateLimiterService(_settings(), redis_client)
+def _token_bucket_rule(**overrides) -> dict:
+    defaults = dict(
+        id="rule-orders",
+        endpoint="/api/v1/orders",
+        identifier_type="global",
+        identifier_value=None,
+        algorithm_id="algo-1",
+        algorithm_name="TokenBucket",
+        params={"capacity": 1, "refill_rate": 1},
+        status="active",
+        priority=100,
+        version=1,
+    )
+    defaults.update(overrides)
+    return defaults
+
+
+def _cache(*rules: dict) -> RulesCache:
+    cache = RulesCache()
+    cache.load_all(list(rules))
+    return cache
+
+
+async def test_uses_matching_db_rule_for_known_endpoint(redis_client):
+    service = RateLimiterService(_settings(), redis_client, rules_cache=_cache(_token_bucket_rule()))
 
     result = await service.check_rate_limit(endpoint="/api/v1/orders", identifier="client-1")
     assert result.allowed is True
@@ -35,7 +53,7 @@ async def test_uses_configured_limiter_for_known_endpoint(redis_client):
 
 
 async def test_falls_back_to_default_for_unknown_endpoint(redis_client):
-    service = RateLimiterService(_settings(), redis_client)
+    service = RateLimiterService(_settings(), redis_client, rules_cache=_cache())
 
     result = await service.check_rate_limit(endpoint="/api/v1/unknown", identifier="client-1")
     assert result.allowed is True
@@ -44,7 +62,7 @@ async def test_falls_back_to_default_for_unknown_endpoint(redis_client):
 
 
 async def test_clients_are_isolated_within_an_endpoint(redis_client):
-    service = RateLimiterService(_settings(), redis_client)
+    service = RateLimiterService(_settings(), redis_client, rules_cache=_cache(_token_bucket_rule()))
 
     result_a = await service.check_rate_limit(endpoint="/api/v1/orders", identifier="a")
     result_b = await service.check_rate_limit(endpoint="/api/v1/orders", identifier="b")

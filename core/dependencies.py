@@ -9,6 +9,7 @@ from repositories.rule_repository import RuleRepository
 from services.algorithm_service import AlgorithmService
 from services.rate_limiter_service import RateLimiterService
 from services.rule_service import RuleService
+from services.rules_cache import RulesCache
 
 
 def get_rate_limiter_service(request: Request) -> RateLimiterService:
@@ -17,6 +18,10 @@ def get_rate_limiter_service(request: Request) -> RateLimiterService:
 
 def get_redis(request: Request) -> Redis:
     return request.app.state.redis_client
+
+
+def get_rules_cache(request: Request) -> RulesCache:
+    return request.app.state.rules_cache
 
 
 def get_rule_service(session: AsyncSession = Depends(get_db)) -> RuleService:

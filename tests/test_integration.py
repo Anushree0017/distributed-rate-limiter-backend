@@ -7,17 +7,16 @@ from tests.conftest import get_test_redis_url
 
 
 def test_check_allows_then_blocks_with_retry_after(tmp_path, monkeypatch):
-    config_path = tmp_path / "rate_limits.yaml"
+    config_path = tmp_path / "default_rate_limits.yml"
     config_path.write_text(
         textwrap.dedent(
             """
             default:
-              identifier_type: client_id
+              identifier_type: endpoint
               config:
                 algorithm: FixedWindow
                 window_size_ms: 60000
                 max_requests: 2
-            endpoints: {}
             """
         )
     )

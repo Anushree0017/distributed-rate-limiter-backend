@@ -29,20 +29,29 @@ core/redis_client.py                   Builds the one process-lifetime Redis con
                                         `ping()` used by both health endpoints and startup
 core/dependencies.py                   FastAPI DI: `get_rate_limiter_service`, `get_redis`
 core/logging.py                        setup_logging() — LOG_LEVEL -> stdlib logging config
+services/rules_cache.py                In-memory hold of all DB rules (Phase 3 Part 2)
+services/rules_loader.py               Startup load + polling background task for RulesCache
+services/rule_algorithm_mapper.py      Translates a DB rule's params to the engine's config
 api/v1/endpoints/rate_limit.py         `POST /check` — the rate-limit decision endpoint
+api/v1/endpoints/rules.py              CRUD for rate-limiting rules (Postgres-backed)
+api/v1/endpoints/algorithms.py         `GET /algorithms` — supported algorithms + param schemas
 api/v1/endpoints/redis_health.py       `GET /redis/health` — Redis diagnostics (memory, evictions,
                                         maxmemory-policy, ...) for humans/dashboards, not probes
 api/health.py                          `GET /health` — liveness + a single Redis PING
 main.py                                Builds the Redis pool (hard-fails boot if unreachable),
-                                        loads config, builds RateLimiterService, wires routes,
-                                        registers the global exception handler
+                                        loads config, loads the rules cache from Postgres
+                                        (hard-fails boot if that fails), builds RateLimiterService,
+                                        starts the rules poll task, wires routes, registers
+                                        exception handlers
 ```
 
 Config is parsed once at FastAPI startup (`lifespan`) and stored on `app.state`, same as the
-Redis connection pool. There is no hot-reload. Rate-limit *decisions* are made by this one
-process at a time per request, but the *state* they're computed from lives in Redis, so this
-service can run as multiple instances/workers pointed at the same Redis without them stepping on
-each other's counters.
+Redis connection pool. The YAML config itself has no hot-reload — but operator-defined rules
+(stored in Postgres via the CRUD API) *are* refreshed, by a polling background task that fully
+reloads the in-memory `RulesCache` every `RULES_POLL_INTERVAL_SECONDS`. Rate-limit *decisions*
+are made by this one process at a time per request, but the *state* they're computed from lives
+in Redis, so this service can run as multiple instances/workers pointed at the same Redis
+without them stepping on each other's counters (each instance keeps its own rules-cache copy).
 
 This service runs independently of the API gateway (it never sees the gateway's actual
 traffic). The gateway calls `POST /api/v1/check` with the target `endpoint` and an `identifier`
@@ -51,53 +60,23 @@ value, gets back a `RateLimitResult`, and enforces it itself (e.g. returning its
 
 ## Config file format
 
-YAML file with a `default` entry (used as a fallback for any endpoint without an explicit
-entry) and a per-endpoint `endpoints` map keyed by request path. Each entry declares an
-`identifier_type` (which value the Gateway should send for that endpoint) and a `config` block
-— algorithm name + that algorithm's params, validated as one unit:
+`config/default_rate_limits.yml` is a **pure fallback**: a single `default` entry, used by
+`POST /api/v1/check` only when no rule in the rules cache matches the request. All real
+per-endpoint / per-identifier limits live in the `rules` table and are managed through the
+`/api/v1/rules` CRUD API (see "How rules reach `/check`" below).
 
 ```yaml
 default:
-  identifier_type: client_id
+  identifier_type: endpoint
   config:
     algorithm: FixedWindow
     window_size_ms: 60000
     max_requests: 100
-
-endpoints:
-  /api/v1/orders:
-    identifier_type: api_key
-    config:
-      algorithm: TokenBucket
-      capacity: 20
-      refill_rate_per_second: 5
-  /api/v1/search:
-    identifier_type: client_id
-    config:
-      algorithm: SlidingWindowLog
-      window_size_ms: 1000
-      max_requests: 10
-  /api/v1/public-search:
-    identifier_type: ip_address
-    config:
-      algorithm: FixedWindow
-      window_size_ms: 1000
-      max_requests: 10
-  /api/v1/checkout:
-    identifier_type: api_key
-    config:
-      algorithm: LeakyBucket
-      capacity: 10
-      leak_rate_per_second: 2
-  /api/v1/reports:
-    identifier_type: client_id
-    config:
-      algorithm: SlidingWindowCounter
-      window_size_ms: 60000
-      max_requests: 30
 ```
 
-Supported `identifier_type` values: `client_id`, `api_key`, `ip_address`.
+`identifier_type: endpoint` means the fallback is a single shared bucket per Redis scope
+(`__default__`) rather than per caller. Other `identifier_type` values (`client_id`, `api_key`,
+`ip_address`) are still accepted here but only `endpoint` makes sense for a shared fallback.
 
 Supported `algorithm` values and their `config` params:
 
@@ -111,22 +90,22 @@ Supported `algorithm` values and their `config` params:
 
 `config` is a Pydantic discriminated union on `algorithm` — every field in the table above is
 required for that algorithm. A missing or malformed param fails config loading immediately with
-a `RateLimiterConfigError` naming the offending endpoint and field, e.g.:
+a `RateLimiterConfigError` naming the offending field, e.g.:
 
 ```
-core.config_loader.RateLimiterConfigError: Invalid rate limit config in config/rate_limits.yaml:
-  - endpoints./api/v1/orders.config.TokenBucket.capacity: Field required
+core.config_loader.RateLimiterConfigError: Invalid rate limit config in config/default_rate_limits.yml:
+  - default.config.FixedWindow.max_requests: Field required
 ```
 
-The app fails to boot on a config error rather than starting with a broken endpoint.
+The app fails to boot on a config error rather than starting with a broken fallback.
 
 ## Pointing the app at a config file
 
 Set `RATE_LIMIT_CONFIG_PATH` in `.env` (or the environment) to the YAML file's path, relative to
-`backend/` or absolute. Defaults to `config/rate_limits.yaml`:
+`backend/` or absolute. Defaults to `config/default_rate_limits.yml`:
 
 ```
-RATE_LIMIT_CONFIG_PATH=config/rate_limits.yaml
+RATE_LIMIT_CONFIG_PATH=config/default_rate_limits.yml
 ```
 
 ## Redis
@@ -199,9 +178,16 @@ Decided once, centrally, in `RateLimiterService.check_rate_limit`:
 ```bash
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
-docker compose up -d redis
+docker compose up -d redis postgres
+./venv/bin/alembic upgrade head        # create + seed the rules/algorithms tables
 ./venv/bin/uvicorn main:app --reload
 ```
+
+Postgres connection: `DATABASE_URL` in `.env` (defaults to
+`postgresql+asyncpg://postgres:postgres@localhost:5432/rate_limiter`). The app **will not start**
+if Redis is unreachable, or if the initial load of all rules from Postgres into the in-memory
+cache fails. `RULES_POLL_INTERVAL_SECONDS` (default `60`) controls how often that cache re-polls
+Postgres for rule changes — see "How rules reach `/check`".
 
 ## Logging
 
@@ -307,7 +293,8 @@ capacity/rate/window/max_requests values all fail fast with a clear message), th
 propagation of a Lua `ResponseError`), `/health`, `/api/v1/redis/health`, and integration tests
 hitting the demo endpoint (and the global exception handler) end-to-end via `TestClient`.
 
-Rules-CRUD tests need a real Postgres too (same "no fakes/testcontainers" philosophy — see
+Every test now needs a real Postgres too — `main.py`'s startup loads the rules cache from the DB
+on every app boot — same "no fakes/testcontainers" philosophy (see
 `.claude/context/redis_guidelines.md`'s reasoning, which this follows equally for Postgres):
 
 ```bash
@@ -315,22 +302,31 @@ docker compose up -d redis postgres
 ./venv/bin/pytest
 ```
 
-They use a `rate_limiter_test` database by default (`TEST_DATABASE_URL`, separate from
+Tests use a `rate_limiter_test` database by default (`TEST_DATABASE_URL`, separate from
 `DATABASE_URL`'s dev database) — create it once if it doesn't exist:
 
 ```bash
 docker exec <postgres-container> psql -U postgres -c "CREATE DATABASE rate_limiter_test;"
 ```
 
-`tests/conftest.py` runs `alembic upgrade head` against it once per test session and truncates
-`rules`/`rule_history` after every test (`algorithms` is left seeded).
+`tests/conftest.py` runs `alembic upgrade head` against it once per test session, points
+`DATABASE_URL` at it for the whole run, and truncates `rules`/`rule_history` after every test
+(`algorithms` is left seeded).
+
+Beyond the CRUD endpoints, the rules-cache/polling layer is covered by: `test_rules_cache.py`
+(the cache in isolation — load/upsert/remove/lookup/readiness/stats), `test_rules_loader.py`
+(the app fails to boot if the initial rule fetch raises; the poll loop picks up a DB change
+within one interval, survives a failed cycle with the previous contents intact, and re-raises
+`CancelledError` on shutdown), and `test_rate_limiter_service_rules_cache.py` (a DB rule
+overrides the YAML config for the same endpoint; `global` fallback; unusable rule falls back
+instead of raising).
 
 ## Rules CRUD API (rate-limiting rule management)
 
-A separate, Postgres-backed API for defining and auditing per-endpoint rate-limiting rules —
-independent of the `/check` decision path above, which still reads its config from
-`config/rate_limits.yaml`. See `.claude/plans/phase3/` for the original design docs (`plan.md`,
-`db_schema.sql`, `api-endpoints.md`) and `CLAUDE.md`'s Phase 3 section for how the implementation
+A Postgres-backed API for defining and auditing per-endpoint rate-limiting rules. Rules created
+here are picked up by the `/check` decision path — see "How rules reach `/check`" below. See
+`.claude/plans/phase3/` for the original design docs (`plan.md`, `db_schema.sql`,
+`api-endpoints.md`, `plan-part2.md`) and `CLAUDE.md`'s Phase 3 sections for how the implementation
 deviated from them.
 
 ### Setup
@@ -394,3 +390,29 @@ All 4xx/5xx responses from the rules-CRUD endpoints use:
 | `VERSION_CONFLICT`      | 409    | `expected_version` doesn't match the current row |
 | `SCOPE_CONFLICT`        | 409    | An active rule already exists for the same scope |
 | `VALIDATION_ERROR`      | 422    | Malformed request body (bad enum value, missing required field, etc.) |
+
+### How rules reach `/check`
+
+At startup the app loads **every** rule from Postgres into an in-process cache
+(`RulesCache`) and refuses to start if that load fails. A background task re-polls Postgres and
+fully replaces the cache every `RULES_POLL_INTERVAL_SECONDS` (default `60`), so a rule created/
+edited/deleted via the CRUD API takes effect on `/check` within one poll interval — no restart.
+The request path only ever reads this in-memory cache, never Postgres.
+
+For a given `/check` request, `RateLimiterService` picks the limiter in this order:
+
+1. an **active** rule scoped to the request's exact `(endpoint, identifier_type, identifier_value)`
+2. else an **active** rule scoped to `(endpoint, "global", null)`
+3. else the static `config/rate_limits.yaml` entry for that endpoint (then its `default`)
+
+The `identifier_type` for steps 1-2 is whatever that endpoint's YAML config declares (the Gateway
+still sends only a bare identifier value). A rule whose `params` don't fit its algorithm is
+skipped as if it didn't exist (falls through to the next step) rather than failing the request.
+
+Rule param names (`limit`, `window_seconds`, `capacity`, `refill_rate`, `leak_rate`,
+`initial_tokens`) are the CRUD layer's own vocabulary and are translated to the engine's config
+internally. `initial_tokens` is currently accepted but ignored — the token-bucket engine always
+starts a bucket full.
+
+Failed polls are logged and retried on the next interval; the previous cache contents stay in
+place, so a transient DB outage never clears rules or crashes the app.

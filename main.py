@@ -1,4 +1,5 @@
 """FastAPI app entry point."""
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -14,6 +15,8 @@ from core.logging import setup_logging
 from core.redis_client import create_redis_pool, get_redis_client, ping
 from core.settings import get_rate_limit_config_path
 from services.rate_limiter_service import RateLimiterService
+from services.rules_cache import RulesCache
+from services.rules_loader import fetch_all_rules_from_db, run_poll_loop
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -35,13 +38,45 @@ async def lifespan(app: FastAPI):
 
     app.state.redis_client = redis_client
     settings = load_rate_limiter_settings(get_rate_limit_config_path())
-    app.state.rate_limiter_service = RateLimiterService(settings, redis_client)
+
+    # Rules cache must be fully loaded — and this must succeed — *before* the
+    # app starts serving traffic. An exception here is deliberately left to
+    # propagate: it fails the boot rather than starting with an empty/unready
+    # cache. See .claude/plans/phase3/plan-part2.md.
+    rules_cache = RulesCache()
+    loaded_rules = await fetch_all_rules_from_db()
+    rules_cache.load_all(loaded_rules)
+    app.state.rules_cache = rules_cache
+
+    logger.info("Loaded %d rate-limiting rule(s) from the database:", len(loaded_rules))
+    for rule in sorted(loaded_rules, key=lambda r: (r["endpoint"], r["identifier_type"], r["priority"])):
+        scope = rule["identifier_value"] if rule["identifier_value"] is not None else "*"
+        logger.info(
+            "  rule %s: endpoint=%s scope=%s:%s algorithm=%s params=%s status=%s priority=%d version=%d",
+            rule["id"],
+            rule["endpoint"],
+            rule["identifier_type"],
+            scope,
+            rule["algorithm_name"],
+            rule["params"],
+            rule["status"],
+            rule["priority"],
+            rule["version"],
+        )
+
+    app.state.rate_limiter_service = RateLimiterService(settings, redis_client, rules_cache=rules_cache)
     logger.info(
-        "Rate limiter service ready: default=%s, %d endpoint(s) configured",
+        "Rate limiter service ready: fallback default=%s, %d DB rule(s) loaded",
         settings.default.config.algorithm,
-        len(settings.endpoints),
+        rules_cache.stats()["rule_count"],
     )
+
+    poll_task = asyncio.create_task(run_poll_loop(rules_cache))
+
     yield
+
+    poll_task.cancel()
+    await asyncio.gather(poll_task, return_exceptions=True)
 
     await redis_client.aclose()
     await redis_pool.disconnect()
