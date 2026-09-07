@@ -21,7 +21,8 @@ against one Redis without their counters diverging. Phase 3 added a Postgres-bac
 (`/api/v1/rules`, `/api/v1/algorithms`) for operators to define and audit per-endpoint
 rate-limiting rules. **Phase 3 Part 2 wires the two together**: at startup the app loads every
 rule from Postgres into an in-process `RulesCache` (`services/rules_cache.py`) and keeps it in
-sync via a polling background task (`services/rules_loader.py`, default 60s). `RateLimiterService`
+sync via an APScheduler job (`core/scheduler.py`, running `services/rules_loader.py`'s
+`load_rules_into_cache`, default every 900s/15min). `RateLimiterService`
 now consults that cache per request — a DB rule matching the request's (endpoint, identifier_value)
 scope wins, then a `global`-scoped rule for the endpoint, then the static
 `config/default_rate_limits.yml` config as fallback. The request path never touches Postgres
@@ -158,9 +159,35 @@ services/rules_cache.py                RulesCache — storage-agnostic in-memory
                                         yet
 services/rules_loader.py               fetch_all_rules_from_db() (reuses
                                         RuleRepository.list_all(), serializes to plain dicts) +
-                                        run_poll_loop() (the background task: full replace each
-                                        cycle, never crashes the app, never clears the cache on a
-                                        failed cycle, re-raises CancelledError)
+                                        load_rules_into_cache() (fetch + cache.load_all(), full
+                                        replace, returns the loaded rules; raises on failure — the
+                                        single fetch+load primitive shared by main.py's startup
+                                        hard-fail path and core/scheduler.py's scheduled poll,
+                                        which is the only place that catches around it)
+core/scheduler.py                      Owns the process's single AsyncIOScheduler instance.
+                                        start_scheduler(rules_cache)/shutdown_scheduler() are the
+                                        only two things main.py's lifespan knows about — it has no
+                                        awareness that rules-polling exists. Registers one job
+                                        (id="rules_poll", IntervalTrigger(seconds=
+                                        RULES_POLL_INTERVAL_SECONDS), max_instances=1,
+                                        coalesce=True, replace_existing=True — the last one works
+                                        around AsyncIOScheduler.shutdown() not clearing its job
+                                        store, so a later start_scheduler() on the same singleton
+                                        doesn't raise ConflictingIdError) whose body
+                                        (_run_scheduled_rules_poll) wraps load_rules_into_cache in
+                                        a log-and-continue try/except — this is now the only place
+                                        that swallows a failed cycle; rules_loader.py itself no
+                                        longer has any loop or resilience logic.
+                                        shutdown_scheduler() calls scheduler.shutdown(wait=False)
+                                        (an in-flight cycle hasn't mutated the cache yet, so
+                                        there's nothing worth blocking shutdown to finish) followed
+                                        by one `await asyncio.sleep(0)` — AsyncIOScheduler defers
+                                        its shutdown state transition via call_soon_threadsafe, so
+                                        without that yield the scheduler still reports itself
+                                        running immediately afterward and a subsequent
+                                        start_scheduler() raises SchedulerAlreadyRunningError
+                                        (hit by every test that boots the app via TestClient,
+                                        since they all share this module-level singleton).
 services/rule_algorithm_mapper.py      build_algorithm_config() — bridges the CRUD param
                                         vocabulary (`limit`, `window_seconds`, `refill_rate`,
                                         `leak_rate`) to the engine's `*Params` field names
@@ -172,7 +199,8 @@ services/rate_limiter_service.py       `_resolve_limiter()` precedence: DB rule 
                                         and falls back rather than failing the request. Redis
                                         scope for a rule-derived limiter is `rule:{rule_id}` so
                                         its state is stable across polls and isolated from YAML
-core/settings.get_rules_poll_interval_seconds()  Reads RULES_POLL_INTERVAL_SECONDS (default 60)
+core/settings.get_rules_poll_interval_seconds()  Reads RULES_POLL_INTERVAL_SECONDS (default 900,
+                                        i.e. 15 minutes)
 core/dependencies.get_rules_cache()    Pulls app.state.rules_cache (for a future debug endpoint)
 ```
 
@@ -383,7 +411,8 @@ boot. Point it at Postgres via `DATABASE_URL` in `.env` (defaults to
 `./venv/bin/alembic upgrade head` against it before first boot (the app does not auto-migrate).
 The app **will not start** if the initial load of all rules from Postgres into `RulesCache`
 fails. Tune how often the cache re-polls Postgres via `RULES_POLL_INTERVAL_SECONDS` in `.env`
-(default `60`) — this is the bound on how stale a rule change can be before `/check` sees it.
+(default `900`, i.e. 15 minutes) — this is the bound on how stale a rule change can be before
+`/check` sees it.
 Set `LOG_LEVEL=DEBUG` to see per-request check details; default `INFO` only logs startup +
 denials. Then hit an endpoint:
 

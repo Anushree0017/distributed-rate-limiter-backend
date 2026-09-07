@@ -11,7 +11,7 @@ _DEFAULT_REDIS_MAX_CONNECTIONS = 20
 _DEFAULT_REDIS_SOCKET_TIMEOUT_SECONDS = 2.0
 _DEFAULT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = 2.0
 _DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/rate_limiter"
-_DEFAULT_RULES_POLL_INTERVAL_SECONDS = 60
+_DEFAULT_RULES_POLL_INTERVAL_SECONDS = 900
 
 
 def get_rate_limit_config_path() -> str:
@@ -56,7 +56,7 @@ def get_database_url() -> str:
 
 
 def get_rules_poll_interval_seconds() -> int:
-    """How often `services/rules_loader.run_poll_loop` re-fetches every rule
+    """How often `core/scheduler.py`'s rules-poll job re-fetches every rule
     from Postgres and fully replaces `RulesCache`'s contents. This is the
     bound on how stale the in-memory rules cache can be relative to the DB —
     see `.claude/plans/phase3/plan-part2.md`.

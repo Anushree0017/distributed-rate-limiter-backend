@@ -1,11 +1,10 @@
 """Loads rules from Postgres into a `RulesCache`, both once at startup and
-repeatedly on a poll interval. See `.claude/plans/phase3/plan-part2.md`.
+repeatedly on a schedule owned by `core/scheduler.py`. See
+`.claude/plans/phase3/plan-part2.md`.
 """
-import asyncio
 import logging
 
 from core.db import get_session_factory
-from core.settings import get_rules_poll_interval_seconds
 from model.rule import Rule
 from repositories.rule_repository import RuleRepository
 from services.rules_cache import RulesCache
@@ -47,25 +46,19 @@ async def fetch_all_rules_from_db() -> list[dict]:
         return [_serialize_rule(rule) for rule in rules]
 
 
-async def run_poll_loop(cache: RulesCache, interval_seconds: int | None = None) -> None:
-    """Runs for the app's lifetime as a background `asyncio.Task`. Each cycle
-    re-fetches every rule and fully replaces the cache's contents — a full
-    replace, not a diff, per plan-part2.md ("simplicity over incremental-
-    update cleverness for this phase").
+async def load_rules_into_cache(cache: RulesCache) -> list[dict]:
+    """Fetch every rule from Postgres and fully replace `cache`'s contents —
+    a full replace, not a diff, per plan-part2.md ("simplicity over
+    incremental-update cleverness for this phase").
 
-    Never crashes the app: a failed cycle is logged and the loop continues,
-    waiting the full interval before retrying (never a tight retry loop), and
-    the previous cache contents are left completely undisturbed — `load_all`
-    is only called on a successful fetch.
+    Raises on failure — this is the single fetch+load primitive used both by
+    the startup hard-fail path (`main.py`'s lifespan, uncaught) and the
+    scheduled poll (`core/scheduler.py`, which catches around this call so a
+    failed cycle logs and continues instead of crashing the app). Returns the
+    loaded rules so callers that need to inspect them (main.py's startup
+    summary log) don't need a second fetch.
     """
-    interval = interval_seconds if interval_seconds is not None else get_rules_poll_interval_seconds()
-    while True:
-        try:
-            await asyncio.sleep(interval)
-            rules = await fetch_all_rules_from_db()
-            cache.load_all(rules)
-            logger.debug("Rules poll succeeded: %d rules loaded", len(rules))
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Rules poll cycle failed; will retry next interval")
+    rules = await fetch_all_rules_from_db()
+    cache.load_all(rules)
+    logger.debug("Rules poll succeeded: %d rules loaded", len(rules))
+    return rules

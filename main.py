@@ -1,5 +1,4 @@
 """FastAPI app entry point."""
-import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -13,10 +12,11 @@ from core.db import dispose_engine
 from core.exceptions import register_exception_handlers
 from core.logging import setup_logging
 from core.redis_client import create_redis_pool, get_redis_client, ping
+from core.scheduler import shutdown_scheduler, start_scheduler
 from core.settings import get_rate_limit_config_path
 from services.rate_limiter_service import RateLimiterService
 from services.rules_cache import RulesCache
-from services.rules_loader import fetch_all_rules_from_db, run_poll_loop
+from services.rules_loader import load_rules_into_cache
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -44,8 +44,7 @@ async def lifespan(app: FastAPI):
     # propagate: it fails the boot rather than starting with an empty/unready
     # cache. See .claude/plans/phase3/plan-part2.md.
     rules_cache = RulesCache()
-    loaded_rules = await fetch_all_rules_from_db()
-    rules_cache.load_all(loaded_rules)
+    loaded_rules = await load_rules_into_cache(rules_cache)
     app.state.rules_cache = rules_cache
 
     logger.info("Loaded %d rate-limiting rule(s) from the database:", len(loaded_rules))
@@ -71,12 +70,15 @@ async def lifespan(app: FastAPI):
         rules_cache.stats()["rule_count"],
     )
 
-    poll_task = asyncio.create_task(run_poll_loop(rules_cache))
+    start_scheduler(rules_cache)
 
     yield
 
-    poll_task.cancel()
-    await asyncio.gather(poll_task, return_exceptions=True)
+    # wait=False: an in-flight poll cycle hasn't mutated the cache yet
+    # (load_all only runs after a successful fetch), so there's nothing to
+    # finish cleanly — don't block shutdown on a DB call whose result would
+    # be discarded anyway.
+    await shutdown_scheduler()
 
     await redis_client.aclose()
     await redis_pool.disconnect()
