@@ -38,7 +38,6 @@ class RuleRepository:
         self,
         endpoint: str,
         identifier_type: str,
-        identifier_value: str | None,
         exclude_id: uuid.UUID | None = None,
     ) -> Rule | None:
         """The service-layer pre-check backstopped by `ux_rules_active_scope`
@@ -48,8 +47,6 @@ class RuleRepository:
         stmt = select(Rule).where(
             Rule.endpoint == endpoint,
             Rule.identifier_type == identifier_type,
-            Rule.identifier_value.is_(identifier_value) if identifier_value is None
-            else Rule.identifier_value == identifier_value,
             Rule.status == RuleStatus.ACTIVE.value,
         )
         if exclude_id is not None:

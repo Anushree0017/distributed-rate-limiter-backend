@@ -49,13 +49,11 @@ async def lifespan(app: FastAPI):
 
     logger.info("Loaded %d rate-limiting rule(s) from the database:", len(loaded_rules))
     for rule in sorted(loaded_rules, key=lambda r: (r["endpoint"], r["identifier_type"], r["priority"])):
-        scope = rule["identifier_value"] if rule["identifier_value"] is not None else "*"
         logger.info(
-            "  rule %s: endpoint=%s scope=%s:%s algorithm=%s params=%s status=%s priority=%d version=%d",
+            "  rule %s: endpoint=%s identifier_type=%s algorithm=%s params=%s status=%s priority=%d version=%d",
             rule["id"],
             rule["endpoint"],
             rule["identifier_type"],
-            scope,
             rule["algorithm_name"],
             rule["params"],
             rule["status"],

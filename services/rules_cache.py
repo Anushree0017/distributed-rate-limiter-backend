@@ -10,10 +10,10 @@ from datetime import datetime, timezone
 
 class RulesCache:
     """Holds the full set of rate-limiting rules in memory, keyed by rule id,
-    plus two secondary indexes the rate limiter uses: one for the exact
-    (endpoint, identifier_type, identifier_value) lookup, and one listing every
-    active rule for an endpoint (so the limiter can find a rule — and its
-    identifier type — knowing only the endpoint and the raw identifier value).
+    plus one secondary index the rate limiter uses: an exact
+    (endpoint, identifier_type) lookup — a rule is now a generic policy for
+    an identifier type on an endpoint, not a specific caller instance, so
+    that pair is the whole scope.
 
     Every **write** (`load_all`, `upsert`, `remove`) is serialized under a
     `threading.Lock` so a reader never observes a partially-rebuilt map;
@@ -33,21 +33,13 @@ class RulesCache:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._rules_by_id: dict[str, dict] = {}
-        self._rules_by_lookup_key: dict[tuple[str, str, str | None], dict] = {}
-        self._rules_by_endpoint: dict[str, list[dict]] = {}
+        self._rules_by_lookup_key: dict[tuple[str, str], dict] = {}
         self._ready = False
         self._last_loaded_at: datetime | None = None
 
     @staticmethod
-    def _lookup_key(rule: dict) -> tuple[str, str, str | None]:
-        return (rule["endpoint"], rule["identifier_type"], rule["identifier_value"])
-
-    @staticmethod
-    def _rebuild_by_endpoint(by_lookup_key: dict) -> dict[str, list[dict]]:
-        by_endpoint: dict[str, list[dict]] = {}
-        for rule in by_lookup_key.values():
-            by_endpoint.setdefault(rule["endpoint"], []).append(rule)
-        return by_endpoint
+    def _lookup_key(rule: dict) -> tuple[str, str]:
+        return (rule["endpoint"], rule["identifier_type"])
 
     def load_all(self, rules: list[dict]) -> None:
         """Full replace — used by both the initial startup load and every
@@ -57,13 +49,9 @@ class RulesCache:
         by_id = {rule["id"]: rule for rule in rules}
         active = [rule for rule in rules if rule["status"] == "active"]
         by_lookup_key = {self._lookup_key(rule): rule for rule in active}
-        by_endpoint: dict[str, list[dict]] = {}
-        for rule in active:
-            by_endpoint.setdefault(rule["endpoint"], []).append(rule)
         with self._lock:
             self._rules_by_id = by_id
             self._rules_by_lookup_key = by_lookup_key
-            self._rules_by_endpoint = by_endpoint
             self._ready = True
             self._last_loaded_at = datetime.now(timezone.utc)
 
@@ -84,7 +72,6 @@ class RulesCache:
                 new_lookup.pop(key, None)
             self._rules_by_id = new_by_id
             self._rules_by_lookup_key = new_lookup
-            self._rules_by_endpoint = self._rebuild_by_endpoint(new_lookup)
 
     def remove(self, rule_id: str) -> None:
         """Kept for future NOTIFY use, same rationale as `upsert`."""
@@ -97,22 +84,12 @@ class RulesCache:
                 new_lookup = dict(self._rules_by_lookup_key)
                 new_lookup.pop(self._lookup_key(existing), None)
                 self._rules_by_lookup_key = new_lookup
-                self._rules_by_endpoint = self._rebuild_by_endpoint(new_lookup)
 
     def get(self, rule_id: str) -> dict | None:
         return self._rules_by_id.get(rule_id)
 
-    def get_by_lookup_key(
-        self, endpoint: str, identifier_type: str, identifier_value: str | None
-    ) -> dict | None:
-        return self._rules_by_lookup_key.get((endpoint, identifier_type, identifier_value))
-
-    def get_endpoint_rules(self, endpoint: str) -> list[dict]:
-        """Every **active** rule for `endpoint`, any scope — the rate limiter
-        uses this to find a rule (and read its identifier type) knowing only
-        the endpoint and the raw identifier value the gateway sent.
-        """
-        return self._rules_by_endpoint.get(endpoint, [])
+    def get_by_lookup_key(self, endpoint: str, identifier_type: str) -> dict | None:
+        return self._rules_by_lookup_key.get((endpoint, identifier_type))
 
     def is_ready(self) -> bool:
         """`False` until the very first `load_all` call completes

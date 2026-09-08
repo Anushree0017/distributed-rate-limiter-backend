@@ -23,3 +23,31 @@ Implement the following:
 
 7. Update or add tests: the poll-cycle function should be tested directly (success case, failure-keeps-old-cache case) without spinning up the scheduler. Add a smoke test that `start_scheduler()` registers exactly one job with the expected trigger interval.
 
+
+---------------------------------------------------------------------------
+
+## Change 2
+
+Remove the `identifier_value` column from the `rules` table and simplify rule matching to be purely per `(endpoint, identifier_type)`, since rules no longer target one specific identifier instance — only generic per-identifier-type policies are supported going forward.
+
+Context: search the codebase first to find the `rules` table definition/migration, the `RulesCache` class, the rule-matching/lookup logic (used both by the `/check` endpoint and the cache-loading path), and the CRUD API's create/update/response schemas for rules. Confirm current structure before making changes — do not assume field names or file locations from this prompt.
+
+Implement the following:
+
+1. **Migration**: add a new migration that drops the `identifier_value` column from `rules`, drops any existing `CHECK` constraint referencing it, and drops/recreates the active-rule uniqueness index to be keyed on `(endpoint, identifier_type)` only (still treating a NULL/empty `endpoint` as a real value for uniqueness purposes, consistent with the existing pattern for global-scope rules). Before writing the DROP COLUMN migration, add a preceding read-only step (a script or a documented manual query) that reports any existing rows where `identifier_value IS NOT NULL`, so this data loss is visible and auditable rather than silent — do not attempt to preserve or migrate that data elsewhere, it is intentionally discarded per product decision.
+
+2. **Rule-matching / lookup logic**: remove `identifier_value` from every query and in-memory comparison that currently matches a rule against an incoming request — matching becomes `endpoint` + `identifier_type` only. Remove any "more specific identifier_value wins over NULL/global" precedence logic, since there is no longer more than one active rule per `(endpoint, identifier_type)`.
+
+3. **`RulesCache`**: change its internal keying from a 3-part `(endpoint, identifier_type, identifier_value)` tuple to a 2-part `(endpoint, identifier_type)` tuple. Update `load_all` and any single-rule upsert/remove methods to match. Confirm no other component derives a cache key using the old 3-part shape.
+
+4. **CRUD API**: remove `identifier_value` from create/update request schemas and from all rule response schemas (list, get, create, update). Confirm no validation logic elsewhere still requires it (e.g. any "must be null when type is global" check tied to the old constraint).
+
+5. **Explicitly unchanged — do not touch**: the `/check` (or equivalent enforcement) endpoint's request contract must continue to accept the actual identifier value from the gateway exactly as today. That value is still used at runtime as the key into the rate limiter's per-client TTL-cached counter state — this change only removes `identifier_value` as a rule-*definition*/matching field, not as a runtime enforcement input.
+
+6. **Tests**:
+   - Update or remove any test asserting two active rules can coexist on the same `(endpoint, identifier_type)` differentiated by `identifier_value` — this should now be rewritten as a test that the second create attempt is rejected by the uniqueness constraint.
+   - Update or remove any rule-matching test that expects a rule with a specific `identifier_value` to take precedence over a more general one.
+   - Update any `RulesCache` test using the old 3-part key to use the 2-part key.
+   - Add a migration test/check confirming the column and old index are gone and the new 2-column unique index exists.
+
+Match existing code style, ORM/query patterns, and test conventions found in the codebase.

@@ -39,7 +39,6 @@ async def test_fetch_all_rules_from_db_returns_plain_dicts(db_session):
         Rule(
             endpoint="/checkout",
             identifier_type="user_id",
-            identifier_value="user-1",
             algorithm_id=algorithm.id,
             params={"limit": 5},
             status=RuleStatus.ACTIVE.value,
@@ -70,7 +69,6 @@ async def test_load_rules_into_cache_replaces_cache_and_returns_rules(db_session
         Rule(
             endpoint="/checkout",
             identifier_type="user_id",
-            identifier_value="user-1",
             algorithm_id=algorithm.id,
             params={"limit": 5},
             status=RuleStatus.ACTIVE.value,
@@ -85,13 +83,13 @@ async def test_load_rules_into_cache_replaces_cache_and_returns_rules(db_session
     loaded = await load_rules_into_cache(cache)
 
     assert len(loaded) == 1
-    assert cache.get_by_lookup_key("/checkout", "user_id", "user-1") is not None
+    assert cache.get_by_lookup_key("/checkout", "user_id") is not None
 
 
 async def test_load_rules_into_cache_raises_on_failure(monkeypatch):
     cache = RulesCache()
     cache.load_all([{"id": "keep-me", "endpoint": "/x", "identifier_type": "global",
-                      "identifier_value": None, "algorithm_id": "a", "algorithm_name": "FixedWindow",
+                      "algorithm_id": "a", "algorithm_name": "FixedWindow",
                       "params": {}, "status": "active", "priority": 100, "version": 1}])
 
     async def _boom():

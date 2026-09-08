@@ -32,13 +32,12 @@ class VersionConflictError(Exception):
 
 
 class ScopeConflictError(Exception):
-    def __init__(self, endpoint, identifier_type, identifier_value):
+    def __init__(self, endpoint, identifier_type):
         self.endpoint = endpoint
         self.identifier_type = identifier_type
-        self.identifier_value = identifier_value
         super().__init__(
             f"An active rule already exists for endpoint={endpoint!r}, "
-            f"identifier_type={identifier_type!r}, identifier_value={identifier_value!r}"
+            f"identifier_type={identifier_type!r}"
         )
 
 
@@ -82,7 +81,6 @@ def register_exception_handlers(app: FastAPI) -> None:
             {
                 "endpoint": exc.endpoint,
                 "identifier_type": exc.identifier_type,
-                "identifier_value": exc.identifier_value,
             },
         )
 

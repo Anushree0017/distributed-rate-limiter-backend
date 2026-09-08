@@ -8,7 +8,7 @@ from services.rules_cache import RulesCache
 async def test_run_scheduled_rules_poll_failure_keeps_old_cache(monkeypatch):
     cache = RulesCache()
     cache.load_all([{"id": "keep-me", "endpoint": "/x", "identifier_type": "global",
-                      "identifier_value": None, "algorithm_id": "a", "algorithm_name": "FixedWindow",
+                      "algorithm_id": "a", "algorithm_name": "FixedWindow",
                       "params": {}, "status": "active", "priority": 100, "version": 1}])
 
     async def _boom(cache):

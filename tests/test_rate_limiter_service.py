@@ -24,7 +24,6 @@ def _token_bucket_rule(**overrides) -> dict:
         id="rule-orders",
         endpoint="/api/v1/orders",
         identifier_type="global",
-        identifier_value=None,
         algorithm_id="algo-1",
         algorithm_name="TokenBucket",
         params={"capacity": 1, "refill_rate": 1},
@@ -45,27 +44,39 @@ def _cache(*rules: dict) -> RulesCache:
 async def test_uses_matching_db_rule_for_known_endpoint(redis_client):
     service = RateLimiterService(_settings(), redis_client, rules_cache=_cache(_token_bucket_rule()))
 
-    result = await service.check_rate_limit(endpoint="/api/v1/orders", identifier="client-1")
+    result = await service.check_rate_limit(
+        endpoint="/api/v1/orders", identifier_value="client-1", identifier_type="client_id"
+    )
     assert result.allowed is True
     # TokenBucket capacity=1, so a second immediate call is blocked.
-    result = await service.check_rate_limit(endpoint="/api/v1/orders", identifier="client-1")
+    result = await service.check_rate_limit(
+        endpoint="/api/v1/orders", identifier_value="client-1", identifier_type="client_id"
+    )
     assert result.allowed is False
 
 
 async def test_falls_back_to_default_for_unknown_endpoint(redis_client):
     service = RateLimiterService(_settings(), redis_client, rules_cache=_cache())
 
-    result = await service.check_rate_limit(endpoint="/api/v1/unknown", identifier="client-1")
+    result = await service.check_rate_limit(
+        endpoint="/api/v1/unknown", identifier_value="client-1", identifier_type="client_id"
+    )
     assert result.allowed is True
-    result = await service.check_rate_limit(endpoint="/api/v1/unknown", identifier="client-1")
+    result = await service.check_rate_limit(
+        endpoint="/api/v1/unknown", identifier_value="client-1", identifier_type="client_id"
+    )
     assert result.allowed is False
 
 
 async def test_clients_are_isolated_within_an_endpoint(redis_client):
     service = RateLimiterService(_settings(), redis_client, rules_cache=_cache(_token_bucket_rule()))
 
-    result_a = await service.check_rate_limit(endpoint="/api/v1/orders", identifier="a")
-    result_b = await service.check_rate_limit(endpoint="/api/v1/orders", identifier="b")
+    result_a = await service.check_rate_limit(
+        endpoint="/api/v1/orders", identifier_value="a", identifier_type="client_id"
+    )
+    result_b = await service.check_rate_limit(
+        endpoint="/api/v1/orders", identifier_value="b", identifier_type="client_id"
+    )
     assert result_a.allowed is True
     assert result_b.allowed is True
 
@@ -82,7 +93,9 @@ async def test_fails_open_with_degraded_flag_on_redis_connection_error(redis_cli
     service = RateLimiterService(_settings(), redis_client)
     service._default.limiter = _ExplodingLimiter(RedisConnectionError("backend unavailable"))
 
-    result = await service.check_rate_limit(endpoint="/api/v1/unknown", identifier="client-1")
+    result = await service.check_rate_limit(
+        endpoint="/api/v1/unknown", identifier_value="client-1", identifier_type="client_id"
+    )
 
     assert result.allowed is True
     assert result.degraded is True
@@ -93,4 +106,6 @@ async def test_response_error_propagates_instead_of_failing_open(redis_client):
     service._default.limiter = _ExplodingLimiter(RedisResponseError("wrong number of KEYS"))
 
     with pytest.raises(RedisResponseError):
-        await service.check_rate_limit(endpoint="/api/v1/unknown", identifier="client-1")
+        await service.check_rate_limit(
+            endpoint="/api/v1/unknown", identifier_value="client-1", identifier_type="client_id"
+        )

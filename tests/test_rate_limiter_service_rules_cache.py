@@ -23,7 +23,6 @@ def _fixed_window_rule(**overrides) -> dict:
         id="rule-1",
         endpoint="/checkout",
         identifier_type="client_id",
-        identifier_value="client-1",
         algorithm_id="algo-1",
         algorithm_name="FixedWindow",
         params={"limit": 1, "window_seconds": 60},
@@ -43,34 +42,45 @@ async def test_a_db_rule_overrides_the_static_yaml_config_for_the_same_endpoint(
     # The DB rule's limit is 1 (far stricter than the YAML config's 100), so
     # a second request from the same client is denied if (and only if) the
     # cache-sourced rule is actually the one being enforced.
-    first = await service.check_rate_limit(endpoint="/checkout", identifier="client-1")
-    second = await service.check_rate_limit(endpoint="/checkout", identifier="client-1")
+    first = await service.check_rate_limit(
+        endpoint="/checkout", identifier_value="client-1", identifier_type="client_id"
+    )
+    second = await service.check_rate_limit(
+        endpoint="/checkout", identifier_value="client-1", identifier_type="client_id"
+    )
     assert first.allowed is True
     assert second.allowed is False
 
 
-async def test_a_different_identifier_value_is_not_covered_by_someone_elses_rule(redis_client):
+async def test_a_different_identifier_type_on_the_same_endpoint_resolves_independently(redis_client):
     cache = RulesCache()
-    cache.load_all([_fixed_window_rule()])  # scoped to client-1 only
+    cache.load_all([_fixed_window_rule()])  # scoped to identifier_type="client_id" only
     service = RateLimiterService(_settings(), redis_client, rules_cache=cache)
 
-    # client-2 has no matching DB rule and no global rule -> falls back to
-    # the static YAML config (limit 100), so it is not denied on request 2.
-    await service.check_rate_limit(endpoint="/checkout", identifier="client-2")
-    second = await service.check_rate_limit(endpoint="/checkout", identifier="client-2")
+    # A request declaring identifier_type="api_key" has no matching DB rule
+    # and no global rule for this endpoint -> falls back to the static YAML
+    # config (limit 100), so it is not denied on request 2.
+    await service.check_rate_limit(endpoint="/checkout", identifier_value="key-1", identifier_type="api_key")
+    second = await service.check_rate_limit(
+        endpoint="/checkout", identifier_value="key-1", identifier_type="api_key"
+    )
     assert second.allowed is True
 
 
-async def test_a_global_rule_applies_when_no_identifier_specific_rule_matches(redis_client):
+async def test_a_global_rule_applies_when_no_exact_type_rule_matches(redis_client):
     global_rule = _fixed_window_rule(
-        id="rule-global", identifier_type="global", identifier_value=None, params={"limit": 1, "window_seconds": 60}
+        id="rule-global", identifier_type="global", params={"limit": 1, "window_seconds": 60}
     )
     cache = RulesCache()
     cache.load_all([global_rule])
     service = RateLimiterService(_settings(), redis_client, rules_cache=cache)
 
-    first = await service.check_rate_limit(endpoint="/checkout", identifier="anyone")
-    second = await service.check_rate_limit(endpoint="/checkout", identifier="anyone")
+    first = await service.check_rate_limit(
+        endpoint="/checkout", identifier_value="anyone", identifier_type="client_id"
+    )
+    second = await service.check_rate_limit(
+        endpoint="/checkout", identifier_value="anyone", identifier_type="client_id"
+    )
     assert first.allowed is True
     assert second.allowed is False
 
@@ -80,7 +90,9 @@ async def test_falls_back_to_static_config_when_no_rule_at_all_matches(redis_cli
     cache.load_all([])  # nothing loaded, but ready
     service = RateLimiterService(_settings(), redis_client, rules_cache=cache)
 
-    result = await service.check_rate_limit(endpoint="/checkout", identifier="client-1")
+    result = await service.check_rate_limit(
+        endpoint="/checkout", identifier_value="client-1", identifier_type="client_id"
+    )
     assert result.allowed is True
 
 
@@ -90,14 +102,18 @@ async def test_unusable_rule_falls_back_instead_of_raising(redis_client):
     cache.load_all([bad_rule])
     service = RateLimiterService(_settings(), redis_client, rules_cache=cache)
 
-    result = await service.check_rate_limit(endpoint="/checkout", identifier="client-1")
+    result = await service.check_rate_limit(
+        endpoint="/checkout", identifier_value="client-1", identifier_type="client_id"
+    )
     assert result.allowed is True
 
 
 async def test_no_rules_cache_behaves_exactly_like_before_this_feature(redis_client):
     service = RateLimiterService(_settings(), redis_client, rules_cache=None)
 
-    result = await service.check_rate_limit(endpoint="/checkout", identifier="client-1")
+    result = await service.check_rate_limit(
+        endpoint="/checkout", identifier_value="client-1", identifier_type="client_id"
+    )
     assert result.allowed is True
 
 
@@ -115,27 +131,25 @@ async def test_matched_rule_identifier_type_is_used_for_the_client_identifier(re
     — asserted directly via _resolve_limiter since the type isn't otherwise
     observable without inspecting the Redis key.
     """
-    rule = _fixed_window_rule(identifier_type="api_key", identifier_value="key-1")
+    rule = _fixed_window_rule(identifier_type="api_key")
     cache = RulesCache()
     cache.load_all([rule])
     service = RateLimiterService(_settings(), redis_client, rules_cache=cache)
 
     _, identifier_type = service._resolve_limiter(
-        endpoint="/checkout", identifier="key-1", fallback=service._default.limiter
+        endpoint="/checkout", identifier_type="api_key", fallback=service._default.limiter
     )
     assert identifier_type is IdentifierType.API_KEY
 
 
 async def test_global_rule_resolves_to_endpoint_identifier_type(redis_client):
-    global_rule = _fixed_window_rule(
-        id="rule-global", identifier_type="global", identifier_value=None
-    )
+    global_rule = _fixed_window_rule(id="rule-global", identifier_type="global")
     cache = RulesCache()
     cache.load_all([global_rule])
     service = RateLimiterService(_settings(), redis_client, rules_cache=cache)
 
     _, identifier_type = service._resolve_limiter(
-        endpoint="/checkout", identifier="anyone", fallback=service._default.limiter
+        endpoint="/checkout", identifier_type="global", fallback=service._default.limiter
     )
     assert identifier_type is IdentifierType.ENDPOINT
 
@@ -146,6 +160,6 @@ async def test_no_rule_match_resolves_to_the_static_defaults_identifier_type(red
     service = RateLimiterService(_settings(), redis_client, rules_cache=cache)
 
     _, identifier_type = service._resolve_limiter(
-        endpoint="/checkout", identifier="client-1", fallback=service._default.limiter
+        endpoint="/checkout", identifier_type="client_id", fallback=service._default.limiter
     )
     assert identifier_type is service._default.identifier_type

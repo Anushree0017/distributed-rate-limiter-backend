@@ -58,7 +58,6 @@ def test_create_get_update_delete_rule_round_trip():
             json={
                 "endpoint": "/checkout",
                 "identifier_type": "user_id",
-                "identifier_value": "user-42",
                 "algorithm_id": algorithm_id,
                 "params": {"limit": 100, "window_seconds": 60},
                 "created_by": "jane.doe",
@@ -95,7 +94,6 @@ def test_create_conflicting_scope_returns_409():
         body = {
             "endpoint": "/orders",
             "identifier_type": "user_id",
-            "identifier_value": "user-1",
             "algorithm_id": algorithm_id,
             "created_by": "jane.doe",
         }
@@ -105,21 +103,6 @@ def test_create_conflicting_scope_returns_409():
         second = client.post("/api/v1/rules", json=body)
         assert second.status_code == 409
         assert second.json()["error"]["code"] == "SCOPE_CONFLICT"
-
-
-def test_create_missing_identifier_value_returns_422():
-    with TestClient(app) as client:
-        algorithm_id = _get_algorithm_id(client)
-        response = client.post(
-            "/api/v1/rules",
-            json={
-                "endpoint": "/orders",
-                "identifier_type": "user_id",
-                "algorithm_id": algorithm_id,
-                "created_by": "jane.doe",
-            },
-        )
-    assert response.status_code == 422
 
 
 def test_create_unknown_algorithm_returns_422():

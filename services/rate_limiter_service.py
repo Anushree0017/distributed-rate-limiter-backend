@@ -79,15 +79,19 @@ class RateLimiterService:
         )
 
     def _resolve_limiter(
-        self, endpoint: str, identifier: str, fallback: RateLimiter
+        self, endpoint: str, identifier_type: str, fallback: RateLimiter
     ) -> tuple[RateLimiter, IdentifierType]:
-        """Precedence: an active DB rule for this endpoint whose
-        `identifier_value` equals the raw identifier the gateway sent wins
-        (its own `identifier_type` is used — the gateway never sends one),
-        then an active `global`-scoped rule for this endpoint, then the
-        static YAML `default`. `rules_cache` is guaranteed ready before the
-        app serves any traffic (main.py's lifespan calls `load_all` before
-        `yield`), so there's no "cache not ready" case to handle here.
+        """Precedence: an active DB rule for exactly `(endpoint,
+        identifier_type)` wins, then an active `global`-scoped rule for this
+        endpoint, then the static YAML `default`. `identifier_type` comes
+        straight from the `/check` request now — the gateway states which
+        attribute it's sending, so lookup is a direct cache hit rather than
+        matching a raw value; there is no priority/id tie-break needed since
+        `ux_rules_active_scope` guarantees at most one active rule per
+        `(endpoint, identifier_type)`. `rules_cache` is guaranteed ready
+        before the app serves any traffic (main.py's lifespan calls
+        `load_all` before `yield`), so there's no "cache not ready" case to
+        handle here.
 
         Returns the limiter to check against *and* the `IdentifierType` to
         key it with — the caller must use the returned type, not assume one,
@@ -106,16 +110,9 @@ class RateLimiterService:
         if self._rules_cache is None:
             return fallback, self._default.identifier_type
 
-        exact = [
-            rule
-            for rule in self._rules_cache.get_endpoint_rules(endpoint)
-            if rule["identifier_value"] == identifier
-        ]
-        rule = min(exact, key=lambda r: (r["priority"], r["id"])) if exact else None
-        if rule is None:
-            rule = self._rules_cache.get_by_lookup_key(
-                endpoint, _GLOBAL_RULE_IDENTIFIER_TYPE, None
-            )
+        rule = self._rules_cache.get_by_lookup_key(endpoint, identifier_type)
+        if rule is None and identifier_type != _GLOBAL_RULE_IDENTIFIER_TYPE:
+            rule = self._rules_cache.get_by_lookup_key(endpoint, _GLOBAL_RULE_IDENTIFIER_TYPE)
         if rule is None:
             return fallback, self._default.identifier_type
 
@@ -148,11 +145,15 @@ class RateLimiterService:
         limiter = RateLimiterFactory.create(config, self._redis_client, scope=f"rule:{rule['id']}")
         return limiter, identifier_type
 
-    async def check_rate_limit(self, endpoint: str, identifier: str) -> RateLimitResult:
-        """Resolve the limiter for `(endpoint, identifier)` — a matching DB
-        rule if one exists, otherwise the static YAML `default` fallback —
-        and check `identifier` against it. The gateway sends only a bare
-        identifier value, never its type.
+    async def check_rate_limit(
+        self, endpoint: str, identifier_value: str, identifier_type: str
+    ) -> RateLimitResult:
+        """Resolve the limiter for `(endpoint, identifier_type)` — a matching
+        DB rule if one exists, otherwise the static YAML `default` fallback —
+        and check `identifier_value` against it. The gateway now states
+        `identifier_type` explicitly (used for rule lookup); `identifier_value`
+        is the raw value that gets baked into the Redis key via
+        `ClientIdentifier`, same role it always played.
 
         Redis failure policy (decided once, here — redis_guidelines.md §7):
         - `ConnectionError` / `TimeoutError` (Redis unreachable or a hung
@@ -165,8 +166,10 @@ class RateLimiterService:
           to the API layer's generic exception handler (500), rather than
           silently failing open and masking the problem.
         """
-        limiter, identifier_type = self._resolve_limiter(endpoint, identifier, self._default.limiter)
-        client_identifier = ClientIdentifier(type=identifier_type, value=identifier)
+        limiter, resolved_identifier_type = self._resolve_limiter(
+            endpoint, identifier_type, self._default.limiter
+        )
+        client_identifier = ClientIdentifier(type=resolved_identifier_type, value=identifier_value)
         algorithm = type(limiter).__name__
 
         try:

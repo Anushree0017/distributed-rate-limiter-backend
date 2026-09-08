@@ -16,7 +16,6 @@ def _rule(**overrides) -> Rule:
         id=uuid.uuid4(),
         endpoint="/checkout",
         identifier_type="user_id",
-        identifier_value="user-1",
         algorithm_id=uuid.uuid4(),
         params={"limit": 100},
         status=RuleStatus.ACTIVE.value,
@@ -41,30 +40,11 @@ async def test_create_rejects_unknown_algorithm():
     request = RuleCreateRequest(
         endpoint="/checkout",
         identifier_type="user_id",
-        identifier_value="user-1",
         algorithm_id=uuid.uuid4(),
         created_by="jane.doe",
     )
     with pytest.raises(AlgorithmNotFoundError):
         await service.create_rule(request)
-
-
-def test_create_request_requires_identifier_value_unless_global():
-    with pytest.raises(ValueError):
-        RuleCreateRequest(
-            endpoint="/checkout",
-            identifier_type="user_id",
-            algorithm_id=uuid.uuid4(),
-            created_by="jane.doe",
-        )
-
-    # global is fine without identifier_value
-    RuleCreateRequest(
-        endpoint="/checkout",
-        identifier_type="global",
-        algorithm_id=uuid.uuid4(),
-        created_by="jane.doe",
-    )
 
 
 async def test_create_maps_db_race_to_scope_conflict():
@@ -77,7 +57,6 @@ async def test_create_maps_db_race_to_scope_conflict():
     request = RuleCreateRequest(
         endpoint="/checkout",
         identifier_type="user_id",
-        identifier_value="user-1",
         algorithm_id=uuid.uuid4(),
         created_by="jane.doe",
     )

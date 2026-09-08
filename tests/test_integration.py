@@ -22,7 +22,11 @@ def test_check_allows_then_blocks_with_retry_after(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("RATE_LIMIT_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
-    payload = {"identifier": "integration-client", "endpoint": "/api/v1/orders"}
+    payload = {
+        "identifier_value": "integration-client",
+        "identifier_type": "client_id",
+        "endpoint": "/api/v1/orders",
+    }
 
     with TestClient(app) as client:
         first = client.post("/api/v1/check", json=payload)
@@ -47,7 +51,9 @@ def test_check_allows_then_blocks_with_retry_after(tmp_path, monkeypatch):
 def test_check_rejects_missing_fields(monkeypatch):
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
     with TestClient(app) as client:
-        response = client.post("/api/v1/check", json={"identifier": "alice"})
+        response = client.post(
+            "/api/v1/check", json={"identifier_value": "alice", "identifier_type": "client_id"}
+        )
     assert response.status_code == 422
 
 
@@ -60,7 +66,7 @@ def test_health_returns_ok(monkeypatch):
 
 
 def test_unhandled_exception_returns_generic_500(monkeypatch):
-    async def _boom(self, endpoint, identifier):
+    async def _boom(self, endpoint, identifier_value, identifier_type):
         raise RuntimeError("something exploded")
 
     monkeypatch.setattr(
@@ -70,7 +76,8 @@ def test_unhandled_exception_returns_generic_500(monkeypatch):
 
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post(
-            "/api/v1/check", json={"identifier": "alice", "endpoint": "/api/v1/orders"}
+            "/api/v1/check",
+            json={"identifier_value": "alice", "identifier_type": "client_id", "endpoint": "/api/v1/orders"},
         )
 
     assert response.status_code == 500

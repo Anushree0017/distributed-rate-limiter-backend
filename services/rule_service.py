@@ -27,7 +27,6 @@ class RuleService:
         rule = Rule(
             endpoint=data.endpoint,
             identifier_type=data.identifier_type.value,
-            identifier_value=data.identifier_value,
             algorithm_id=data.algorithm_id,
             params=data.params,
             status=RuleStatus.ACTIVE.value,
@@ -41,7 +40,7 @@ class RuleService:
             # Race-condition backstop: `ux_rules_active_scope` (db_schema.sql)
             # rejected a concurrent duplicate that slipped past no pre-check
             # here (create has no "existing row" to pre-check against).
-            raise ScopeConflictError(data.endpoint, data.identifier_type.value, data.identifier_value)
+            raise ScopeConflictError(data.endpoint, data.identifier_type.value)
 
     async def get_rule(self, rule_id: uuid.UUID) -> Rule:
         rule = await self._repository.get_by_id(rule_id)
@@ -64,15 +63,14 @@ class RuleService:
         # SELECT below would trigger autoflush mid-update: a partial UPDATE
         # (and a spurious extra `rule_history` row from `fn_rules_history`)
         # ahead of the real one at commit time.
-        new_identifier_value = data.identifier_value if data.identifier_value is not None else rule.identifier_value
         new_status = data.status.value if data.status is not None else rule.status
 
         if new_status == RuleStatus.ACTIVE.value:
             conflict = await self._repository.find_active_conflict(
-                rule.endpoint, rule.identifier_type, new_identifier_value, exclude_id=rule.id
+                rule.endpoint, rule.identifier_type, exclude_id=rule.id
             )
             if conflict is not None:
-                raise ScopeConflictError(rule.endpoint, rule.identifier_type, new_identifier_value)
+                raise ScopeConflictError(rule.endpoint, rule.identifier_type)
 
         if data.algorithm_id is not None:
             rule.algorithm_id = data.algorithm_id
@@ -80,7 +78,6 @@ class RuleService:
             rule.params = data.params
         if data.priority is not None:
             rule.priority = data.priority
-        rule.identifier_value = new_identifier_value
         rule.status = new_status
         rule.updated_by = data.updated_by
         rule.version += 1
@@ -88,7 +85,7 @@ class RuleService:
         try:
             return await self._repository.update(rule)
         except IntegrityError:
-            raise ScopeConflictError(rule.endpoint, rule.identifier_type, rule.identifier_value)
+            raise ScopeConflictError(rule.endpoint, rule.identifier_type)
 
     async def delete_rule(self, rule_id: uuid.UUID) -> None:
         rule = await self.get_rule(rule_id)

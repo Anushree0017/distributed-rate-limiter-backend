@@ -4,7 +4,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from dto.algorithm_dto import AlgorithmSummary
 from model.rule_identifier_type import RuleIdentifierType
@@ -14,23 +14,15 @@ from model.rule_status import RuleStatus
 class RuleCreateRequest(BaseModel):
     endpoint: str
     identifier_type: RuleIdentifierType
-    identifier_value: str | None = None
     algorithm_id: uuid.UUID
     params: dict = {}
     priority: int = 100
     created_by: str
 
-    @model_validator(mode="after")
-    def _require_identifier_value_unless_global(self) -> "RuleCreateRequest":
-        if self.identifier_type != RuleIdentifierType.GLOBAL and not self.identifier_value:
-            raise ValueError("identifier_value is required unless identifier_type is 'global'")
-        return self
-
 
 class RuleUpdateRequest(BaseModel):
     """All fields optional except `updated_by`, per the API contract."""
 
-    identifier_value: str | None = None
     algorithm_id: uuid.UUID | None = None
     params: dict | None = None
     priority: int | None = None
@@ -45,7 +37,6 @@ class RuleResponse(BaseModel):
     id: uuid.UUID
     endpoint: str
     identifier_type: str
-    identifier_value: str | None
     algorithm: AlgorithmSummary
     params: dict
     status: str

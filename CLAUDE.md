@@ -13,23 +13,29 @@
 Phase 1 (core rate limiter), Improvisation 1 (multi-identifier, strict config validation, TTL
 eviction, standardized response fields), Improvisation 2 (non-positive config value validation,
 `/health`, a global exception handler, and app-wide logging), **Phase 2 (Redis + Lua
-integration)**, **Phase 3 (rules CRUD service)**, and **Phase 3 Part 2 (rules cache + polling,
-wired into `/check`)** are all **fully implemented**. Rate-limit state still lives in Redis for
-the `/check` decision path — every algorithm's check-and-increment runs as a single atomic Lua
-script — rather than in an in-process cache, so this service can run as multiple instances/workers
-against one Redis without their counters diverging. Phase 3 added a Postgres-backed CRUD API
-(`/api/v1/rules`, `/api/v1/algorithms`) for operators to define and audit per-endpoint
-rate-limiting rules. **Phase 3 Part 2 wires the two together**: at startup the app loads every
-rule from Postgres into an in-process `RulesCache` (`services/rules_cache.py`) and keeps it in
-sync via an APScheduler job (`core/scheduler.py`, running `services/rules_loader.py`'s
-`load_rules_into_cache`, default every 900s/15min). `RateLimiterService`
-now consults that cache per request — a DB rule matching the request's (endpoint, identifier_value)
-scope wins, then a `global`-scoped rule for the endpoint, then the static
-`config/default_rate_limits.yml` config as fallback. The request path never touches Postgres
-directly. The `IdentifierType` actually used to build the Redis key is likewise sourced from the
-cache (the matched rule's `identifier_type`, mapped via `_RULE_TO_ENGINE_IDENTIFIER_TYPE`) or from
-the static config's `default.identifier_type` on any fallback path — never hardcoded. See the
-"Deviations from the Phase 3 Part 2 plan" section for the exact mapping.
+integration)**, **Phase 3 (rules CRUD service)**, **Phase 3 Part 2 (rules cache + polling,
+wired into `/check`)**, and a clean-code pass removing `rules.identifier_value` (see "Deviations
+from the identifier_value-removal change" below) are all **fully implemented**. Rate-limit state
+still lives in Redis for the `/check` decision path — every algorithm's check-and-increment runs
+as a single atomic Lua script — rather than in an in-process cache, so this service can run as
+multiple instances/workers against one Redis without their counters diverging. Phase 3 added a
+Postgres-backed CRUD API (`/api/v1/rules`, `/api/v1/algorithms`) for operators to define and audit
+per-endpoint rate-limiting rules — a rule is now a generic policy for an `identifier_type` on an
+`endpoint`, not a specific caller instance (there is no `identifier_value` on a rule). **Phase 3
+Part 2 wires the two together**: at startup the app loads every rule from Postgres into an
+in-process `RulesCache` (`services/rules_cache.py`) and keeps it in sync via an APScheduler job
+(`core/scheduler.py`, running `services/rules_loader.py`'s `load_rules_into_cache`, default every
+900s/15min). `RateLimiterService` now consults that cache per request — a DB rule matching the
+`/check` request's exact `(endpoint, identifier_type)` scope wins, then a `global`-scoped rule
+for the endpoint, then the static `config/default_rate_limits.yml` config as fallback. The
+request path never touches Postgres directly. `POST /check` states `identifier_type` explicitly
+(it drives this lookup) alongside `identifier_value` (the raw value baked into the Redis key,
+never used for matching). The `IdentifierType` actually used to build the Redis key is sourced
+from the cache (the matched rule's `identifier_type`, mapped via
+`_RULE_TO_ENGINE_IDENTIFIER_TYPE`) or from the static config's `default.identifier_type` on any
+fallback path — never hardcoded. See the "Deviations from the Phase 3 Part 2 plan" section for
+the exact mapping, and "Deviations from the identifier_value-removal change" for why `/check`
+gained `identifier_type`.
 See `README.md` for the user-facing config format, running instructions, and API docs — don't
 duplicate that here. Any future change that touches Redis, Lua, or the fail-open policy should
 also read `.claude/context/redis_guidelines.md`, which Phase 2 was built against and which still
@@ -134,8 +140,8 @@ services/rule_service.py               Owns scope-collision checks, optimistic v
                                         extra `rule_history` row)
 services/algorithm_service.py          Thin pass-through to AlgorithmRepository
 dto/rule_dto.py, dto/algorithm_dto.py, Pydantic request/response schemas. `RuleCreateRequest`
-dto/identifier_dto.py                  enforces "identifier_value required unless global" via a
-                                        model_validator. `AlgorithmResponse.param_schema` is
+dto/identifier_dto.py                  has no `identifier_value` field (removed — see "Deviations
+                                        from the identifier_value-removal change"). `AlgorithmResponse.param_schema` is
                                         assembled explicitly in the controller from the ORM
                                         column named `params` (see deviations)
 api/v1/endpoints/rules.py              All 6 `/rules*` endpoints from api-endpoints.md
@@ -143,16 +149,23 @@ api/v1/endpoints/algorithms.py         `GET /algorithms`
 alembic/                               0001 create algorithms -> 0002 seed algorithms -> 0003
                                         create rules (+ux_rules_active_scope, indexes,
                                         touch-updated_at trigger) -> 0004 create rule_history
-                                        (+audit trigger) -> 0005 seed sample rules (10 demo rows,
+                                        (+audit trigger) -> 0005 seed sample rules (23 demo rows,
+                                        one per `RuleIdentifierType` member,
                                         `created_by='seed_migration'`; the test suite truncates
-                                        these at session start). `env.py` pulls the URL from
-                                        core.settings.get_database_url() and imports every model
-                                        for autogenerate
+                                        these at session start) -> 0006 drop `identifier_value`
+                                        from `rules` and rebuild `ux_rules_active_scope` as
+                                        `UNIQUE (endpoint, identifier_type) WHERE status='active'`
+                                        (data-destructive; see "Deviations from the
+                                        identifier_value-removal change"). `env.py` pulls the URL
+                                        from core.settings.get_database_url() and imports every
+                                        model for autogenerate
 
 --- Phase 3 Part 2 (rules cache + polling into /check) ---
 services/rules_cache.py                RulesCache — storage-agnostic in-memory hold of all rules,
-                                        keyed by id + a secondary (endpoint, identifier_type,
-                                        identifier_value) lookup index (active rules only).
+                                        keyed by id + a secondary (endpoint, identifier_type)
+                                        lookup index (active rules only) — a rule is a generic
+                                        policy for an identifier type on an endpoint, so that pair
+                                        is the whole scope (no identifier_value dimension).
                                         `load_all` swaps both maps atomically under a
                                         threading.Lock; reads are lock-free. `upsert`/`remove`
                                         exist for a future LISTEN/NOTIFY path — nothing calls them
@@ -194,11 +207,15 @@ services/rule_algorithm_mapper.py      build_algorithm_config() — bridges the 
                                         (`max_requests`, `window_size_ms`, ...). `initial_tokens`
                                         is accepted but ignored (engine has no such knob)
 services/rate_limiter_service.py       `_resolve_limiter()` precedence: DB rule for the exact
-                                        identifier -> `global` rule for the endpoint -> static
-                                        YAML config. An unusable rule (bad algorithm/params) logs
-                                        and falls back rather than failing the request. Redis
-                                        scope for a rule-derived limiter is `rule:{rule_id}` so
-                                        its state is stable across polls and isolated from YAML
+                                        `(endpoint, identifier_type)` -> `global` rule for the
+                                        endpoint -> static YAML config; `identifier_type` comes
+                                        straight from the `/check` request, so there's no
+                                        priority/id tie-break (at most one active rule per
+                                        `(endpoint, identifier_type)`). An unusable rule (bad
+                                        algorithm/params) logs and falls back rather than failing
+                                        the request. Redis scope for a rule-derived limiter is
+                                        `rule:{rule_id}` so its state is stable across polls and
+                                        isolated from YAML
 core/settings.get_rules_poll_interval_seconds()  Reads RULES_POLL_INTERVAL_SECONDS (default 900,
                                         i.e. 15 minutes)
 core/dependencies.get_rules_cache()    Pulls app.state.rules_cache (for a future debug endpoint)
@@ -301,6 +318,9 @@ core/dependencies.get_rules_cache()    Pulls app.state.rules_cache (for a future
   can fail in more than one way.
 
 ### Deviations from the Phase 3 (rules CRUD) plan worth knowing about
+(Note: `identifier_value` described below was later removed entirely — see "Deviations from the
+identifier_value-removal change" further down. This section is kept as the historical record of
+why it existed in the first place.)
 - **`db_schema.sql`'s `rules` table was missing `identifier_value` entirely**, even though
   `api-endpoints.md`'s request/response bodies assume it exists and the draft's own comment above
   `ux_rules_active_scope` ("Only one ACTIVE rule per (endpoint, identifier_type, identifier_value)
@@ -354,10 +374,12 @@ core/dependencies.get_rules_cache()    Pulls app.state.rules_cache (for a future
   delete.
 - **Rule resolution precedence in `RateLimiterService._resolve_limiter`** (the plan said this was
   "already decided from earlier design discussion" — it wasn't, so this is the decision):
-  exact-identifier DB rule → `global`-scoped DB rule for that endpoint → static
-  `config/default_rate_limits.yml`'s single `default` limiter (there is no per-endpoint YAML
-  config anymore — `RateLimiterSettings` only has a `default` field). There is **no** "cache not
-  ready" fallback on the request path — startup guarantees readiness before traffic.
+  exact `(endpoint, identifier_type)` DB rule → `global`-scoped DB rule for that endpoint →
+  static `config/default_rate_limits.yml`'s single `default` limiter (there is no per-endpoint
+  YAML config anymore — `RateLimiterSettings` only has a `default` field). There is **no** "cache
+  not ready" fallback on the request path — startup guarantees readiness before traffic. (This
+  precedence was later changed from identifier-*value* matching to identifier-*type* matching —
+  see "Deviations from the identifier_value-removal change".)
 - **Two identifier-type vocabularies are bridged in `rate_limiter_service.py`** via
   `_RULE_TO_ENGINE_IDENTIFIER_TYPE`, an explicit dict exhaustive over every `RuleIdentifierType`
   value (17 members) mapped to a runtime `IdentifierType` member. `IdentifierType` was extended
@@ -390,6 +412,41 @@ core/dependencies.get_rules_cache()    Pulls app.state.rules_cache (for a future
   resets `core.db`'s cached engine before/after each test (each test has its own event loop; an
   asyncpg engine can't be shared across loops).
 
+### Deviations from the identifier_value-removal change worth knowing about
+(This is Change 2 of `.claude/plans/phase3/clean-code-changes.md`: rules no longer target one
+specific identifier instance, only generic per-`identifier_type` policies.)
+- **`POST /check` gained an `identifier_type` field and renamed its bare `identifier` field to
+  `identifier_value`** — not called for by the original clean-code-changes.md text (which said
+  the `/check` contract must stay untouched), but a real gap the removal exposed: once a rule can
+  only be matched by `(endpoint, identifier_type)`, and `/check` used to send only a bare value
+  with no type, there was nothing left to disambiguate "this caller's own rule" from "the
+  endpoint's `global` rule." Resolved by having the Gateway state `identifier_type` explicitly
+  (it already knows this, same as it always knew which attribute it was sending) — this is a
+  deliberate, explicitly-approved deviation from that plan's "don't touch `/check`" instruction,
+  not an oversight.
+- **`identifier_type` (rule lookup) and `identifier_value` (Redis key) are a naming coincidence
+  with the *removed* rule-definition `identifier_value` field** — the two are unrelated: a rule's
+  `identifier_type` says which attribute a policy applies to; `/check`'s `identifier_type` says
+  which attribute the current caller is presenting; `/check`'s `identifier_value` is that
+  attribute's raw value, purely a runtime enforcement input, never a rule-matching field.
+- **`_resolve_limiter`'s tie-break logic (`min(exact, key=(priority, id))`) was deleted, not just
+  relaxed** — with `identifier_value` gone, `ux_rules_active_scope` guarantees at most one active
+  rule per `(endpoint, identifier_type)`, so `get_by_lookup_key` always returns at most one match
+  and there's nothing left to break a tie between.
+- **`RulesCache._rules_by_endpoint` (the `get_endpoint_rules()` secondary index) was deleted
+  entirely, not left in place** — it existed only to support the old exact-value scan in
+  `_resolve_limiter`; once that scan was replaced by a direct `get_by_lookup_key(endpoint,
+  identifier_type)` call, nothing else in the codebase needed "every rule for this endpoint,"
+  and this project's convention is not to keep unused code speculatively.
+- **`ScopeConflictError` and `find_active_conflict()` dropped their `identifier_value` parameter
+  entirely** (2-arg / `(endpoint, identifier_type)`-only now), rather than keeping it as an
+  always-`None` placeholder — same "no unused code" rationale.
+- Migration `0006` is destructive and non-reversible for data: any seeded/operator-created row
+  with a non-null `identifier_value` loses that value permanently on upgrade. Run
+  `scripts/audit_rules_identifier_value.py` first to see what will be discarded — this was run
+  against this repo's own seed data before merging and reported 18 of the 23 seeded rows
+  (everything except the five `global`-scoped ones).
+
 ## Running the service
 
 This project does not run its dependencies via Docker (there is a `docker-compose.yml` in the
@@ -421,13 +478,13 @@ curl -i http://127.0.0.1:8000/health
 
 curl -i -X POST http://127.0.0.1:8000/api/v1/check \
   -H "Content-Type: application/json" \
-  -d '{"endpoint": "/api/v1/orders", "identifier": "api-key-abc123"}'
+  -d '{"endpoint": "/api/v1/orders", "identifier_type": "api_key", "identifier_value": "api-key-abc123"}'
 
 curl -i http://127.0.0.1:8000/api/v1/algorithms
 
 curl -i -X POST http://127.0.0.1:8000/api/v1/rules \
   -H "Content-Type: application/json" \
-  -d '{"endpoint": "/checkout", "identifier_type": "user_id", "identifier_value": "user-42", "algorithm_id": "<uuid from /algorithms>", "params": {"limit": 100}, "created_by": "jane.doe"}'
+  -d '{"endpoint": "/checkout", "identifier_type": "user_id", "algorithm_id": "<uuid from /algorithms>", "params": {"limit": 100}, "created_by": "jane.doe"}'
 ```
 
 See `README.md` for the full config YAML shape, Redis env vars, key-naming/TTL conventions, the

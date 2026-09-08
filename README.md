@@ -224,10 +224,12 @@ curl -s http://127.0.0.1:8000/api/v1/redis/health
 
 ### `POST /api/v1/check`
 
-Body: `{"endpoint": "<endpoint path being requested>", "identifier": "<caller identifier>"}`.
-`identifier` is a single value — whichever `client_id` / `api_key` / `ip_address` value the
-target endpoint's config declares via `identifier_type`. The Gateway is expected to already know
-which value to send, from the same shared config.
+Body: `{"endpoint": "<endpoint path being requested>", "identifier_type": "<rule identifier type>", "identifier_value": "<caller identifier>"}`.
+`identifier_type` states which attribute is being sent (`client_id` / `api_key` / `ip` / ...,
+same vocabulary as a rule's `identifier_type`) and drives rule lookup — matching is a direct
+`(endpoint, identifier_type)` cache hit. `identifier_value` is that attribute's raw value; it
+never participates in rule matching, only in building the per-caller Redis key. The Gateway is
+expected to already know both, from the same shared config.
 
 Always returns `200` with a `RateLimitResult` body — this service reports the decision, it
 doesn't enforce it. The caller (the API gateway) is responsible for rejecting the original
@@ -236,11 +238,11 @@ request when `allowed` is `false`.
 ```bash
 curl -i -X POST http://127.0.0.1:8000/api/v1/check \
   -H "Content-Type: application/json" \
-  -d '{"endpoint": "/api/v1/orders", "identifier": "api-key-abc123"}'
+  -d '{"endpoint": "/api/v1/orders", "identifier_type": "api_key", "identifier_value": "api-key-abc123"}'
 
 curl -i -X POST http://127.0.0.1:8000/api/v1/check \
   -H "Content-Type: application/json" \
-  -d '{"endpoint": "/api/v1/public-search", "identifier": "203.0.113.7"}'
+  -d '{"endpoint": "/api/v1/public-search", "identifier_type": "ip", "identifier_value": "203.0.113.7"}'
 ```
 
 `endpoint` is matched against the YAML config's `endpoints` keys; if there's no entry for it,
@@ -350,7 +352,7 @@ writes to it directly).
 | `GET /rules`                 | List rules, filterable by `endpoint`, `identifier_type`, `status`, `algorithm_id`; paginated (`page`, `page_size`, max 100) |
 | `GET /rules/{id}`             | Fetch one rule |
 | `POST /rules`                 | Create a rule (`status` defaults to `active`, `version` to `1`) |
-| `PATCH /rules/{id}`           | Partial update (`params`, `priority`, `status`, `identifier_value`, `algorithm_id`); `expected_version` enables optimistic concurrency |
+| `PATCH /rules/{id}`           | Partial update (`params`, `priority`, `status`, `algorithm_id`); `expected_version` enables optimistic concurrency |
 | `DELETE /rules/{id}`          | Hard-delete; the final state is preserved in `rule_history` |
 | `GET /rules/identifiers`      | Static list of the 17 supported `identifier_type` values, for UI dropdowns |
 | `GET /algorithms`             | List available algorithms + their `param_schema` |
@@ -363,17 +365,22 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/rules \
   -d '{
     "endpoint": "/checkout",
     "identifier_type": "user_id",
-    "identifier_value": "user-42",
     "algorithm_id": "<uuid from /algorithms>",
     "params": {"limit": 100, "window_seconds": 60},
     "created_by": "jane.doe"
   }'
 ```
 
-`identifier_value` is required unless `identifier_type` is `"global"`. Only one **active** rule
-can exist per `(endpoint, identifier_type, identifier_value)` scope — enforced by a partial unique
-index in Postgres (`ux_rules_active_scope`) and pre-checked in the service layer for a specific
-error message; a deactivated/deleted rule never blocks a new active one in the same scope.
+A rule is a generic policy for an `identifier_type` on an `endpoint`, not a specific caller
+instance — there's no field to target one particular user/key/IP value. Only one **active** rule
+can exist per `(endpoint, identifier_type)` scope — enforced by a partial unique index in
+Postgres (`ux_rules_active_scope`) and pre-checked in the service layer for a specific error
+message; a deactivated/deleted rule never blocks a new active one in the same scope.
+
+Note: this rule-definition `identifier_type` is unrelated to (but shares a name with) the
+`identifier_type`/`identifier_value` fields on the `/check` request above — the `/check` fields
+describe one incoming call's caller attribute, while a rule's `identifier_type` describes which
+attribute the rule's policy applies to.
 
 ### Error envelope
 
@@ -401,13 +408,15 @@ The request path only ever reads this in-memory cache, never Postgres.
 
 For a given `/check` request, `RateLimiterService` picks the limiter in this order:
 
-1. an **active** rule scoped to the request's exact `(endpoint, identifier_type, identifier_value)`
-2. else an **active** rule scoped to `(endpoint, "global", null)`
+1. an **active** rule scoped to the request's exact `(endpoint, identifier_type)`
+2. else an **active** rule scoped to `(endpoint, "global")`
 3. else the static `config/rate_limits.yaml` entry for that endpoint (then its `default`)
 
-The `identifier_type` for steps 1-2 is whatever that endpoint's YAML config declares (the Gateway
-still sends only a bare identifier value). A rule whose `params` don't fit its algorithm is
-skipped as if it didn't exist (falls through to the next step) rather than failing the request.
+`identifier_type` for steps 1-2 comes straight from the `/check` request body — the Gateway
+states which attribute it's sending, so there's no priority/id tie-break needed (at most one
+active rule can exist per `(endpoint, identifier_type)`). A rule whose `params` don't fit its
+algorithm is skipped as if it didn't exist (falls through to the next step) rather than failing
+the request.
 
 Rule param names (`limit`, `window_seconds`, `capacity`, `refill_rate`, `leak_rate`,
 `initial_tokens`) are the CRUD layer's own vocabulary and are translated to the engine's config

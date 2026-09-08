@@ -23,7 +23,6 @@ def _serialize_rule(rule: Rule) -> dict:
         "id": str(rule.id),
         "endpoint": rule.endpoint,
         "identifier_type": rule.identifier_type,
-        "identifier_value": rule.identifier_value,
         "algorithm_id": str(rule.algorithm_id),
         "algorithm_name": rule.algorithm.name,
         "params": dict(rule.params),

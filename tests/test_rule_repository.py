@@ -17,7 +17,6 @@ def _make_rule(algorithm_id, **overrides) -> Rule:
     defaults = dict(
         endpoint="/checkout",
         identifier_type="user_id",
-        identifier_value="user-1",
         algorithm_id=algorithm_id,
         params={"limit": 100},
         status=RuleStatus.ACTIVE.value,
@@ -69,13 +68,13 @@ async def test_inactive_rule_does_not_block_a_new_active_rule_in_same_scope(db_s
     assert second.id != first.id
 
 
-async def test_global_scope_treats_null_identifier_value_as_a_single_slot(db_session):
+async def test_global_scope_is_a_single_slot(db_session):
     algorithm_id = await _an_algorithm_id(db_session)
     repo = RuleRepository(db_session)
-    await repo.create(_make_rule(algorithm_id, identifier_type="global", identifier_value=None))
+    await repo.create(_make_rule(algorithm_id, identifier_type="global"))
 
     with pytest.raises(IntegrityError):
-        await repo.create(_make_rule(algorithm_id, identifier_type="global", identifier_value=None))
+        await repo.create(_make_rule(algorithm_id, identifier_type="global"))
 
 
 async def test_find_active_conflict_excludes_given_id(db_session):
@@ -83,8 +82,8 @@ async def test_find_active_conflict_excludes_given_id(db_session):
     repo = RuleRepository(db_session)
     rule = await repo.create(_make_rule(algorithm_id))
 
-    assert await repo.find_active_conflict("/checkout", "user_id", "user-1") is not None
-    assert await repo.find_active_conflict("/checkout", "user_id", "user-1", exclude_id=rule.id) is None
+    assert await repo.find_active_conflict("/checkout", "user_id") is not None
+    assert await repo.find_active_conflict("/checkout", "user_id", exclude_id=rule.id) is None
 
 
 async def test_delete_removes_the_row(db_session):
@@ -101,9 +100,7 @@ async def test_list_filters_and_paginates(db_session):
     algorithm_id = await _an_algorithm_id(db_session)
     repo = RuleRepository(db_session)
     for i in range(3):
-        await repo.create(
-            _make_rule(algorithm_id, endpoint=f"/endpoint-{i}", identifier_value=f"user-{i}")
-        )
+        await repo.create(_make_rule(algorithm_id, endpoint=f"/endpoint-{i}"))
 
     items, total = await repo.list(RuleFilter(page=1, page_size=2))
     assert total == 3

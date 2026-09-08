@@ -23,7 +23,6 @@ class Rule(Base):
     )
     endpoint: Mapped[str] = mapped_column(String, nullable=False)
     identifier_type: Mapped[str] = mapped_column(String, nullable=False)
-    identifier_value: Mapped[str | None] = mapped_column(String, nullable=True)
     algorithm_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("algorithms.id"), nullable=False
     )
