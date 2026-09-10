@@ -13,7 +13,7 @@ from core.exceptions import register_exception_handlers
 from core.logging import setup_logging
 from core.redis_client import create_redis_pool, get_redis_client, ping
 from core.scheduler import shutdown_scheduler, start_scheduler
-from core.settings import get_rate_limit_config_path
+from core.settings import settings as env_settings
 from services.rate_limiter.script_loader import register_all_scripts
 from services.rate_limiter_service import RateLimiterService
 from services.rules_cache import RulesCache
@@ -45,7 +45,7 @@ async def lifespan(app: FastAPI):
     registered_scripts = await register_all_scripts(redis_client)
     logger.info("Registered Lua scripts: %s", ", ".join(registered_scripts))
 
-    settings = load_rate_limiter_settings(get_rate_limit_config_path())
+    settings = load_rate_limiter_settings(env_settings.get_rate_limit_config_path())
 
     # Rules cache must be fully loaded — and this must succeed — *before* the
     # app starts serving traffic. An exception here is deliberately left to

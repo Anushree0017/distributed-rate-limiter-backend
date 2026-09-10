@@ -71,6 +71,8 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from core.settings import settings
+
 _DEFAULT_TEST_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/rate_limiter_test"
 
 
@@ -116,6 +118,7 @@ def _point_every_test_at_the_scratch_database():
     """
     original = os.environ.get("DATABASE_URL")
     os.environ["DATABASE_URL"] = get_test_database_url()
+    settings.reload()
     try:
         yield
     finally:
@@ -123,6 +126,19 @@ def _point_every_test_at_the_scratch_database():
             os.environ.pop("DATABASE_URL", None)
         else:
             os.environ["DATABASE_URL"] = original
+        settings.reload()
+
+
+@pytest.fixture(autouse=True)
+def _reset_settings_after_test():
+    """Every test's own env mutations (monkeypatch.setenv, os.environ[...] =)
+    call `settings.reload()` themselves when they need the new value to take
+    effect immediately — this fixture only guarantees the *next* test starts
+    with `settings` back in sync with real `os.environ`, since monkeypatch's
+    automatic env-var revert on teardown doesn't itself call `reload()`.
+    """
+    yield
+    settings.reload()
 
 
 @pytest_asyncio.fixture(autouse=True)

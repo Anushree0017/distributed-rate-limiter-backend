@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+from core.settings import settings
 from main import app
 from tests.conftest import get_test_redis_url
 
@@ -16,6 +17,7 @@ _EXPECTED_FIELDS = {
 
 def test_redis_health_returns_diagnostic_fields(monkeypatch):
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
+    settings.reload()
     with TestClient(app) as client:
         response = client.get("/api/v1/redis/health")
 

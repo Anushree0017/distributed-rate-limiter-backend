@@ -9,7 +9,7 @@ from collections.abc import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
-from core.settings import get_database_url
+from core.settings import settings
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
@@ -22,7 +22,7 @@ class Base(DeclarativeBase):
 def get_engine() -> AsyncEngine:
     global _engine
     if _engine is None:
-        _engine = create_async_engine(get_database_url(), pool_pre_ping=True)
+        _engine = create_async_engine(settings.get_database_url(), pool_pre_ping=True)
     return _engine
 
 

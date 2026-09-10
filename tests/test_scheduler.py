@@ -2,6 +2,7 @@
 scheduler-owned failure-handling wrapper around `load_rules_into_cache`.
 """
 from core.scheduler import _run_scheduled_rules_poll, _scheduler, shutdown_scheduler, start_scheduler
+from core.settings import settings
 from services.rules_cache import RulesCache
 
 
@@ -24,6 +25,7 @@ async def test_run_scheduled_rules_poll_failure_keeps_old_cache(monkeypatch):
 
 async def test_start_scheduler_registers_exactly_one_job_with_configured_interval(monkeypatch):
     monkeypatch.setenv("RULES_POLL_INTERVAL_SECONDS", "45")
+    settings.reload()
     cache = RulesCache()
     cache.load_all([])
     try:

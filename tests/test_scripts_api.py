@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from redis.exceptions import RedisError
 
+from core.settings import settings
 from main import app
 from tests.conftest import get_test_redis_url
 
@@ -15,6 +16,7 @@ _SCRIPT_NAMES = sorted(path.stem for path in _SCRIPTS_DIR.glob("*.lua"))
 
 def test_reload_scripts_returns_every_registered_script_name(monkeypatch):
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
+    settings.reload()
     with TestClient(app) as client:
         response = client.post("/api/v1/scripts/reload")
 
@@ -27,6 +29,7 @@ def test_reload_scripts_leaves_scripts_invocable(monkeypatch):
     # Confirms flush-then-reregister leaves the process able to actually run a
     # check afterwards, not just that register_all_scripts() reports success.
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
+    settings.reload()
     payload = {
         "identifier_value": "scripts-reload-client",
         "identifier_type": "client_id",
@@ -45,6 +48,7 @@ def test_reload_scripts_leaves_scripts_invocable(monkeypatch):
 
 def test_reload_scripts_returns_503_on_registration_failure(monkeypatch):
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
+    settings.reload()
     with TestClient(app) as client:
         async def _boom(*args, **kwargs):
             raise RedisError("boom")

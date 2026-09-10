@@ -10,12 +10,12 @@ import asyncio
 
 from sqlalchemy import text
 
-from core.settings import get_database_url
+from core.settings import settings
 from sqlalchemy.ext.asyncio import create_async_engine
 
 
 async def main() -> None:
-    engine = create_async_engine(get_database_url())
+    engine = create_async_engine(settings.get_database_url())
     async with engine.connect() as conn:
         result = await conn.execute(
             text(

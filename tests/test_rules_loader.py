@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from core.settings import settings
 from repositories.algorithm_repository import AlgorithmRepository
 from repositories.rule_repository import RuleRepository
 from services.rules_cache import RulesCache
@@ -17,6 +18,7 @@ from tests.conftest import get_test_database_url, get_test_redis_url
 @pytest.fixture(autouse=True)
 async def _redis_env(monkeypatch):
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
+    settings.reload()
     yield
 
 

@@ -2,6 +2,7 @@ import textwrap
 
 from fastapi.testclient import TestClient
 
+from core.settings import settings
 from main import app
 from tests.conftest import get_test_redis_url
 
@@ -22,6 +23,7 @@ def test_check_allows_then_blocks_with_retry_after(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("RATE_LIMIT_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
+    settings.reload()
     payload = {
         "identifier_value": "integration-client",
         "identifier_type": "client_id",
@@ -50,6 +52,7 @@ def test_check_allows_then_blocks_with_retry_after(tmp_path, monkeypatch):
 
 def test_check_rejects_missing_fields(monkeypatch):
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
+    settings.reload()
     with TestClient(app) as client:
         response = client.post(
             "/api/v1/check", json={"identifier_value": "alice", "identifier_type": "client_id"}
@@ -59,6 +62,7 @@ def test_check_rejects_missing_fields(monkeypatch):
 
 def test_health_returns_ok(monkeypatch):
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
+    settings.reload()
     with TestClient(app) as client:
         response = client.get("/health")
     assert response.status_code == 200
@@ -73,6 +77,7 @@ def test_unhandled_exception_returns_generic_500(monkeypatch):
         "services.rate_limiter_service.RateLimiterService.check_rate_limit", _boom
     )
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
+    settings.reload()
 
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post(

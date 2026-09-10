@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
 from core.db import Base
-from core.settings import get_database_url
+from core.settings import settings
 
 # Import every ORM model so `Base.metadata` is fully populated for
 # autogenerate — mirrors the FK order noted in
@@ -28,7 +28,7 @@ if config.config_file_name is not None:
 # `DATABASE_URL` (core/settings.get_database_url) is the single source of
 # truth for the connection string, same as the app itself — overrides
 # whatever placeholder is in alembic.ini.
-config.set_main_option("sqlalchemy.url", get_database_url())
+config.set_main_option("sqlalchemy.url", settings.get_database_url())
 
 target_metadata = Base.metadata
 

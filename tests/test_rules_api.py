@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from core.settings import settings
 from main import app
 from tests.conftest import get_test_database_url, get_test_redis_url
 
@@ -20,6 +21,7 @@ from tests.conftest import get_test_database_url, get_test_redis_url
 @pytest_asyncio.fixture(autouse=True)
 async def _point_app_at_test_redis_and_clean_up(monkeypatch):
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
+    settings.reload()
     yield
 
     engine = create_async_engine(get_test_database_url())

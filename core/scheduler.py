@@ -8,7 +8,7 @@ import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from core.settings import get_rules_poll_interval_seconds
+from core.settings import settings
 from services.rules_cache import RulesCache
 from services.rules_loader import load_rules_into_cache
 
@@ -47,7 +47,7 @@ def start_scheduler(rules_cache: RulesCache) -> None:
     """
     _scheduler.add_job(
         _run_scheduled_rules_poll,
-        trigger=IntervalTrigger(seconds=get_rules_poll_interval_seconds()),
+        trigger=IntervalTrigger(seconds=settings.get_rules_poll_interval_seconds()),
         kwargs={"cache": rules_cache},
         id="rules_poll",
         max_instances=1,
@@ -55,7 +55,7 @@ def start_scheduler(rules_cache: RulesCache) -> None:
         replace_existing=True,
     )
     _scheduler.start()
-    logger.info("Rules-poll scheduler started (interval=%ds)", get_rules_poll_interval_seconds())
+    logger.info("Rules-poll scheduler started (interval=%ds)", settings.get_rules_poll_interval_seconds())
 
 
 async def shutdown_scheduler() -> None:

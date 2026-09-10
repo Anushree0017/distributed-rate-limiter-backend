@@ -81,10 +81,12 @@ dto/rate_limit_check_request.py        RateLimitCheckRequest — the POST /check
 core/config_loader.py                  YAML -> RateLimiterSettings, loaded once at FastAPI startup;
                                         raises RateLimiterConfigError naming the offending
                                         endpoint/field on bad config (fail fast, app won't boot)
-core/settings.py                       Reads RATE_LIMIT_CONFIG_PATH, REDIS_URL, and Redis pool
-                                        tuning env vars (REDIS_MAX_CONNECTIONS,
-                                        REDIS_SOCKET_TIMEOUT_SECONDS,
-                                        REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS)
+core/settings.py                       Settings class + a module-level `settings` singleton.
+                                        Env vars (RATE_LIMIT_CONFIG_PATH, REDIS_URL, Redis pool
+                                        tuning vars, DATABASE_URL, RULES_POLL_INTERVAL_SECONDS,
+                                        LOG_LEVEL) are read once at construction and cached;
+                                        `settings.reload()` re-reads them into the same instance
+                                        (tests only — see "Working conventions")
 core/redis_client.py                   create_redis_pool() / get_redis_client() — one
                                         ConnectionPool for the process lifetime, built in
                                         main.py's lifespan, never per-request; ping() used by both
@@ -281,13 +283,15 @@ core/dependencies.get_rules_cache()    Pulls app.state.rules_cache (for a future
   semantically-correct TTL (e.g. a token bucket's TTL is "however long a full refill from empty
   would take") inside its own Lua script. There is deliberately no generic "client TTL" knob
   anymore.
-- **`core/settings.py` stayed a collection of plain `os.getenv`-reading functions**, not a
-  Pydantic `BaseSettings` model, even though the Redis guidelines doc suggested "add ... to
-  `core/settings.py`'s Pydantic settings model." This codebase never had a Pydantic settings
-  model — `core/settings.py` predates this phase and already used the plain-function pattern for
-  `RATE_LIMIT_CONFIG_PATH`. The new Redis settings (`get_redis_url`, `get_redis_max_connections`,
-  `get_redis_socket_timeout_seconds`, `get_redis_socket_connect_timeout_seconds`) follow that
-  existing convention instead of introducing a second settings pattern alongside it.
+- **`core/settings.py` stayed a collection of plain `os.getenv`-reading functions at the time**,
+  not a Pydantic `BaseSettings` model, even though the Redis guidelines doc suggested "add ... to
+  `core/settings.py`'s Pydantic settings model." The new Redis settings (`get_redis_url`,
+  `get_redis_max_connections`, `get_redis_socket_timeout_seconds`,
+  `get_redis_socket_connect_timeout_seconds`) followed that existing free-function convention
+  instead of introducing a second settings pattern alongside it. **This was later superseded**:
+  `core/settings.py` is now a `Settings` class (still not Pydantic `BaseSettings`) exposed as a
+  module-level `settings` singleton, by explicit request — see "Working conventions" for the
+  test-side implication of caching env vars at construction instead of re-reading them per call.
 - **Leaky bucket's admission check needed an off-by-epsilon fix that isn't in the original
   in-memory algorithm's tests, but is a real bug the original algorithm also has.** The original
   in-memory `LeakyBucketLimiter` (and the initial Lua port) admitted a new request whenever
@@ -575,6 +579,12 @@ the 429/headers on real traffic; this service only reports a decision.
   a `rate_limiter_test` database to exist (`psql -U postgres -c "CREATE DATABASE
   rate_limiter_test;"` once) — `tests/conftest.py` runs migrations against it automatically each
   test session.
+- `core/settings.settings` caches every env var at construction, not per-call — any test that
+  mutates an env var it reads (`monkeypatch.setenv`, direct `os.environ[...]` assignment) must
+  call `settings.reload()` immediately afterward for that value to actually take effect (e.g.
+  before `with TestClient(app)` boots the app). `tests/conftest.py`'s autouse
+  `_reset_settings_after_test` fixture only resets `settings` back to real `os.environ` *between*
+  tests (cleanup) — it doesn't help a test see its own env override take effect.
 - Rules-CRUD layering is `controller -> service -> repository -> model`, strictly: controllers
   (`api/v1/endpoints/rules.py`, `algorithms.py`) never touch the DB session or ORM models directly;
   services (`services/rule_service.py`, `algorithm_service.py`) own business rules and never build
