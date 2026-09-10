@@ -12,7 +12,7 @@ from redis.asyncio import Redis
 from interfaces.base import RateLimiter
 from model.identifier import ClientIdentifier
 from model.rate_limit_result import RateLimitResult
-from services.rate_limiter.script_loader import load_script
+from services.rate_limiter.script_loader import get_script, run_script
 
 
 class FixedWindowLimiter(RateLimiter):
@@ -21,13 +21,14 @@ class FixedWindowLimiter(RateLimiter):
         self._max_requests = max_requests
         self._redis = redis_client
         self._scope = scope
-        self._script = load_script(redis_client, "fixed_window")
+        self._script = get_script("fixed_window")
 
     def _key(self, identifier: ClientIdentifier) -> str:
         return f"rl:fixed_window:{self._scope}:{identifier.key()}"
 
     async def check(self, identifier: ClientIdentifier) -> RateLimitResult:
-        allowed, limit, remaining, retry_after_ms, reset_at_ms = await self._script(
+        allowed, limit, remaining, retry_after_ms, reset_at_ms = await run_script(
+            self._script,
             keys=[self._key(identifier)],
             args=[self._window_size_ms, self._max_requests],
         )

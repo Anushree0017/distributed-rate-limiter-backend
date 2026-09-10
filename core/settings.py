@@ -5,11 +5,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_DEFAULT_CONFIG_PATH = "config/rate_limits.yaml"
+_DEFAULT_CONFIG_PATH = "config/default_rate_limits.yml"
 _DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 _DEFAULT_REDIS_MAX_CONNECTIONS = 20
 _DEFAULT_REDIS_SOCKET_TIMEOUT_SECONDS = 2.0
 _DEFAULT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = 2.0
+_DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/rate_limiter"
+_DEFAULT_RULES_POLL_INTERVAL_SECONDS = 900
 
 
 def get_rate_limit_config_path() -> str:
@@ -43,3 +45,20 @@ def get_redis_socket_connect_timeout_seconds() -> float:
     return float(
         os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS", _DEFAULT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS)
     )
+
+
+def get_database_url() -> str:
+    """`postgresql+asyncpg://[user[:password]@]host:port/dbname` — the
+    rules-CRUD service's Postgres connection string. Never log this value
+    verbatim if it carries credentials.
+    """
+    return os.getenv("DATABASE_URL", _DEFAULT_DATABASE_URL)
+
+
+def get_rules_poll_interval_seconds() -> int:
+    """How often `core/scheduler.py`'s rules-poll job re-fetches every rule
+    from Postgres and fully replaces `RulesCache`'s contents. This is the
+    bound on how stale the in-memory rules cache can be relative to the DB —
+    see `.claude/plans/phase3/plan-part2.md`.
+    """
+    return int(os.getenv("RULES_POLL_INTERVAL_SECONDS", _DEFAULT_RULES_POLL_INTERVAL_SECONDS))

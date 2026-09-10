@@ -1,4 +1,7 @@
-"""Loads and validates the rate limiter YAML config, once, at startup."""
+"""Loads and validates the static fallback rate limiter YAML config, once, at
+startup. This config is only consulted by `/check` when no rule in the rules
+cache matches — see `services/rate_limiter_service.py`.
+"""
 import logging
 from pathlib import Path
 
@@ -11,11 +14,12 @@ logger = logging.getLogger(__name__)
 
 
 class RateLimiterConfigError(Exception):
-    """Raised when the rate limiter YAML config fails validation at startup.
+    """Raised when the fallback rate limiter YAML config fails validation at
+    startup.
 
     The app must fail to boot on this — never start serving with a broken
-    endpoint config — so the message names the offending endpoint and field
-    directly, without requiring a re-read of the code to interpret.
+    fallback config — so the message names the offending field directly,
+    without requiring a re-read of the code to interpret.
     """
 
 
@@ -35,17 +39,16 @@ def load_rate_limiter_settings(path: str | Path) -> RateLimiterSettings:
         raise RateLimiterConfigError(message) from exc
 
     logger.info(
-        "Loaded rate limit config from %s: default=%s, %d endpoint(s) configured",
+        "Loaded fallback rate limit config from %s: default algorithm=%s",
         config_file,
         settings.default.config.algorithm,
-        len(settings.endpoints),
     )
     return settings
 
 
 def _format_validation_error(config_file: Path, exc: ValidationError) -> str:
-    """Turn Pydantic's error list into one line per offending endpoint/field,
-    e.g. `endpoints./api/v1/orders.config.capacity: Field required`.
+    """Turn Pydantic's error list into one line per offending field,
+    e.g. `default.config.FixedWindow.max_requests: Field required`.
     """
     lines = [f"Invalid rate limit config in {config_file}:"]
     for error in exc.errors():

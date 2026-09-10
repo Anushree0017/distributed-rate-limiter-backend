@@ -1,0 +1,9 @@
+# Fallback rate limit config. Used by POST /api/v1/check ONLY when no rule in the
+# rules cache (Postgres-backed) matches the request. All real per-endpoint and
+# per-identifier limits live in the `rules` table, managed via /api/v1/rules.
+default:
+  identifier_type: endpoint
+  config:
+    algorithm: FixedWindow
+    window_size_ms: 60000
+    max_requests: 100

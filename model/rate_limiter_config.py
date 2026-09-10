@@ -58,11 +58,11 @@ AlgorithmConfig = Annotated[
 
 
 class EndpointConfig(BaseModel):
-    """Config entry for one endpoint: which identifier it's keyed by, plus its
-    algorithm + params, validated up front via the `AlgorithmConfig`
-    discriminated union — an endpoint with a missing/invalid algorithm param
-    fails Pydantic validation at config-load time, before any request ever
-    reaches the factory.
+    """One (identifier_type, algorithm + params) pair, validated up front via
+    the `AlgorithmConfig` discriminated union — a missing/invalid algorithm
+    param fails Pydantic validation at config-load time, before any request
+    ever reaches the factory. Used for the static fallback `default` and,
+    internally, for limiters derived from DB rules.
     """
 
     identifier_type: IdentifierType
@@ -70,5 +70,10 @@ class EndpointConfig(BaseModel):
 
 
 class RateLimiterSettings(BaseModel):
+    """The static fallback config: a single `default` limiter, used by
+    `POST /api/v1/check` only when no rule in the rules cache matches the
+    request. Per-endpoint / per-identifier limits live in the `rules` table,
+    not here.
+    """
+
     default: EndpointConfig
-    endpoints: dict[str, EndpointConfig] = Field(default_factory=dict)

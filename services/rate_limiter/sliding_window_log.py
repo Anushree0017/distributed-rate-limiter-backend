@@ -9,7 +9,7 @@ from redis.asyncio import Redis
 from interfaces.base import RateLimiter
 from model.identifier import ClientIdentifier
 from model.rate_limit_result import RateLimitResult
-from services.rate_limiter.script_loader import load_script
+from services.rate_limiter.script_loader import get_script, run_script
 
 
 class SlidingWindowLogLimiter(RateLimiter):
@@ -18,7 +18,7 @@ class SlidingWindowLogLimiter(RateLimiter):
         self._max_requests = max_requests
         self._redis = redis_client
         self._scope = scope
-        self._script = load_script(redis_client, "sliding_window_log")
+        self._script = get_script("sliding_window_log")
 
     def _key(self, identifier: ClientIdentifier) -> str:
         return f"rl:sliding_window_log:{self._scope}:{identifier.key()}"
@@ -27,7 +27,8 @@ class SlidingWindowLogLimiter(RateLimiter):
         # Two requests can land in the same millisecond; a ZSET member must be
         # unique, and Lua must not generate this itself (guidelines §4).
         request_id = uuid.uuid4().hex
-        allowed, limit, remaining, retry_after_ms, reset_at_ms = await self._script(
+        allowed, limit, remaining, retry_after_ms, reset_at_ms = await run_script(
+            self._script,
             keys=[self._key(identifier)],
             args=[self._window_size_ms, self._max_requests, request_id],
         )
