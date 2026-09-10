@@ -41,10 +41,11 @@ class RateLimiterFactory:
     algorithm + params (including two endpoints that fall back to the same
     default), so their rate-limit state stays isolated the same way separate
     in-memory instances kept it isolated pre-Redis. Every algorithm class
-    still only registers its Lua script once for the process lifetime
-    regardless of how many `scope`s use it — that dedup lives in
-    `script_loader.load_script`, not here, so isolation and "register once"
-    aren't in tension (see CLAUDE.md's deviations section for why this
+    has its Lua script registered exactly
+    once, up front, at app startup (`main.py`'s lifespan calls
+    `script_loader.register_all_scripts`) — every instance built here just
+    looks its script up via `script_loader.get_script`, so isolation and
+    "register once" aren't in tension (see CLAUDE.md's deviations section for why this
     differs from the plan's original "cache instances per (algorithm,
     config)" suggestion).
     """

@@ -51,3 +51,69 @@ Implement the following:
    - Add a migration test/check confirming the column and old index are gone and the new 2-column unique index exists.
 
 Match existing code style, ORM/query patterns, and test conventions found in the codebase.
+
+---------------------------------------------------------------------------
+
+## Change 3
+
+Register every algorithm's Lua script once, explicitly, at app startup instead of lazily on
+first use — and remove the old lazy-registration function entirely.
+
+Context: `services/rate_limiter/script_loader.py`'s `load_script(redis_client, script_name)` was
+called from each of the 5 `RateLimiter` algorithm classes' `__init__` (`TokenBucketLimiter`,
+`FixedWindowLimiter`, `LeakyBucketLimiter`, `SlidingWindowLogLimiter`,
+`SlidingWindowCounterLimiter`), caching the returned `AsyncScript` per `(id(redis_client),
+script_name)`. `redis_client.register_script(...)` itself never talks to Redis — it only computes
+a local SHA1 — so the real upload (`SCRIPT LOAD`) happened even later, inside `AsyncScript.__call__`,
+the first time a script was actually invoked (an `EVALSHA`→`NOSCRIPT`→`SCRIPT LOAD`→`EVALSHA` retry
+dance). This meant whichever `/check` request was first to hit a given algorithm paid one extra
+Redis round-trip that every later request skipped.
+
+Implemented:
+
+1. **`services/rate_limiter/script_loader.py`**: removed `load_script` entirely. Added
+   `register_all_scripts(redis_client) -> list[str]`, which globs every `.lua` file under
+   `scripts/`, calls `register_script()` + an explicit `await redis_client.script_load(...)` for
+   each (forcing the upload immediately instead of deferring it), and populates `_script_cache`
+   (now keyed by `script_name` alone, not `(id(redis_client), script_name)`, since there's exactly
+   one registration event per process). Wrapped each iteration in `try/except (RedisError,
+   OSError)`, logging which script failed with a full traceback and raising a new
+   `ScriptRegistrationError` chained from the original — stops at the first failure rather than
+   registering the rest. Added `get_script(script_name) -> AsyncScript`, a plain cache lookup that
+   logs and raises `RuntimeError` if called before `register_all_scripts()` has run. Added
+   `run_script(script, keys, args)`, which wraps `await script(keys=.., args=..)`, logs (script
+   name + full traceback) and re-raises unchanged on any failure — centralizing that logging in
+   one place rather than duplicating a try/except across all 5 algorithm classes.
+2. **All 5 algorithm classes**: swapped `self._script = load_script(redis_client, name)` for
+   `self._script = get_script(name)` (no `redis_client` argument — the script is the one
+   process-wide object set up at startup, not bound per constructing client), and swapped
+   `await self._script(keys=.., args=..)` for `await run_script(self._script, keys=.., args=..)`
+   in each `check()` method.
+3. **`main.py`**: `lifespan` now calls `await register_all_scripts(redis_client)` right after the
+   existing Redis PING check succeeds and before `RateLimiterService` is constructed, then logs
+   `"Registered Lua scripts: %s"` with the returned names. No try/except around the call — a
+   `ScriptRegistrationError` (already logged inside `register_all_scripts`) is left to propagate
+   and fail app boot, the same fail-fast policy already applied to the PING check and the initial
+   rules-cache load.
+4. **`tests/conftest.py`**: the `redis_client` fixture now calls `await
+   register_all_scripts(client)` right after creating the client and flushing it, before
+   yielding — every test that builds a `RateLimiter` directly (bypassing the real app/`lifespan`)
+   needs scripts registered against its own client first. This also rebinds
+   `AsyncScript.registered_client` to the current test's live connection each time, since the
+   previous test's client is closed in teardown and `_script_cache` is now keyed by name only, not
+   by client identity.
+5. **New tests** (`tests/test_script_loader.py`): `register_all_scripts` returns every script name
+   found under `scripts/`; `get_script` returns a registered script for each name and raises
+   `RuntimeError` (with a log record) for an unknown one; `register_all_scripts` raises
+   `ScriptRegistrationError` (with a log record naming the failing script) when `script_load` is
+   made to fail; `run_script` re-raises the original exception type unchanged (with a log record
+   naming the script) when the wrapped call fails.
+
+Object construction was **not** changed to be eager — rule-derived `RateLimiter` instances are
+still built per-request in `RateLimiterService._resolve_limiter`, and the static-config `default`
+limiter is still built once in `RateLimiterService.__init__`. Only script *registration* moved
+earlier; nothing about *when limiter objects get constructed* changed. Pre-building limiter
+objects per rule at startup was considered and rejected — rules can be added/changed/deactivated
+between `RulesCache` polls (every `RULES_POLL_INTERVAL_SECONDS`), so pre-built objects would need
+rebuilding on every poll cycle anyway, with no benefit over building them lazily per request; the
+only genuinely one-time, static cost was the script upload, which is what this change front-loads.

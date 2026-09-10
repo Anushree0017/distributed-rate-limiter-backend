@@ -8,6 +8,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 
+from services.rate_limiter.script_loader import ScriptRegistrationError
+
 
 class RuleNotFoundError(Exception):
     def __init__(self, rule_id):
@@ -95,6 +97,10 @@ def register_exception_handlers(app: FastAPI) -> None:
             "SCOPE_CONFLICT",
             "An active rule already exists for this endpoint/identifier scope",
         )
+
+    @app.exception_handler(ScriptRegistrationError)
+    async def _script_registration_failed(request: Request, exc: ScriptRegistrationError) -> JSONResponse:
+        return _error_response(503, "SCRIPT_REGISTRATION_FAILED", str(exc))
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:

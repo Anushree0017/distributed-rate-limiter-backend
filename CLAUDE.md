@@ -55,9 +55,14 @@ services/rate_limiter/scripts/*.lua    The actual check-and-increment logic per 
                                         Atomic (single Lua script per check), TTL set in the same
                                         script as the write, "now" always read via
                                         redis.call("TIME") — never the app server's clock
-services/rate_limiter/script_loader.py load_script(redis_client, name) -> Script, cached per
-                                        (id(redis_client), script_name) so register_script() runs
-                                        once per script for the process lifetime
+services/rate_limiter/script_loader.py register_all_scripts(redis_client) -> list[str], called
+                                        once from main.py's lifespan at startup — uploads every
+                                        script via SCRIPT LOAD and caches each AsyncScript by
+                                        script_name. get_script(name) is the lookup every algorithm
+                                        class's __init__ uses (raises if called before startup
+                                        registration). run_script(script, keys, args) wraps actual
+                                        invocation, logging and re-raising unchanged on failure.
+                                        No lazy per-instance registration path exists anymore.
 services/factory.py                    RateLimiterFactory: (EndpointConfig, Redis, scope) ->
                                         RateLimiter instance
 services/rate_limiter_service.py       RateLimiterService — the only class the API layer talks to;
@@ -256,10 +261,13 @@ core/dependencies.get_rules_cache()    Pulls app.state.rules_cache (for a future
     `RateLimiterFactory.create(config, redis_client, scope)` down to each algorithm's key-building
     method — this is what actually keeps endpoints isolated.
   - The "`register_script()` should run once per script, not once per instantiation" goal (the
-    actual efficiency concern behind Stage 4) is instead satisfied by `script_loader.load_script`
-    caching the `Script` object per `(redis client, script name)` — so N endpoints using
-    `TokenBucket` share one registered script, but N separate `TokenBucketLimiter` instances (and
-    thus N isolated Redis keyspaces). See `tests/test_factory.py`'s
+    actual efficiency concern behind Stage 4) is instead satisfied by every script being
+    registered exactly once, at app startup, via `script_loader.register_all_scripts` — each
+    algorithm class's `__init__` just calls `script_loader.get_script(name)` to fetch the
+    already-registered `AsyncScript` (see "Deviations from the script-registration-at-startup
+    change" below for the full history) — so N endpoints using `TokenBucket` share one registered
+    script, but N separate `TokenBucketLimiter` instances (and thus N isolated Redis keyspaces).
+    See `tests/test_factory.py`'s
     `test_two_scopes_with_identical_config_get_isolated_keys` and
     `test_same_script_is_registered_once_across_scopes` for both halves of this being verified
     together.
@@ -446,6 +454,42 @@ specific identifier instance, only generic per-`identifier_type` policies.)
   `scripts/audit_rules_identifier_value.py` first to see what will be discarded — this was run
   against this repo's own seed data before merging and reported 18 of the 23 seeded rows
   (everything except the five `global`-scoped ones).
+
+### Deviations from the script-registration-at-startup change worth knowing about
+(This is Change 3 of `.claude/plans/phase3/clean-code-changes.md`: Lua scripts are now registered
+once at app startup instead of lazily, on first use, per algorithm instance.)
+- **`load_script(redis_client, script_name)` was removed entirely**, not deprecated alongside a
+  new path — every algorithm class's `__init__` now calls `script_loader.get_script(script_name)`
+  (no `redis_client` argument; scripts are process-wide, not per-client) instead. There is no lazy
+  registration path left in the codebase.
+- **The upload to Redis was already lazy before this change in a way that wasn't obvious from
+  `load_script`'s name**: `redis_client.register_script(...)` never talks to Redis — it only
+  computes a local SHA1. The actual `SCRIPT LOAD` happened even later, inside `AsyncScript.__call__`,
+  the first time a script was invoked (an `EVALSHA`→`NOSCRIPT`→`SCRIPT LOAD`→`EVALSHA` retry).
+  `register_all_scripts()` closes that gap by calling `await redis_client.script_load(...)`
+  explicitly for every script at startup, so no request ever pays that round-trip.
+- **`_script_cache` changed key shape** from `(id(redis_client), script_name)` to `script_name`
+  alone, since there is now exactly one registration event per process using exactly one Redis
+  client (the same "one client for the process lifetime" pattern `core/redis_client.py` already
+  documents) — there's no longer a need to disambiguate by client identity.
+- **Object construction was deliberately left lazy** — this change only moves *script
+  registration* earlier; rule-derived `RateLimiter` instances are still built per-request in
+  `RateLimiterService._resolve_limiter`, and the static-config `default` limiter is still built
+  once in `RateLimiterService.__init__`. Pre-building limiter objects per rule at startup was
+  considered and rejected: rules can be added/changed/deactivated between `RulesCache` polls, so
+  pre-built objects would need rebuilding on every poll cycle anyway, with no benefit over building
+  them lazily per request.
+- **A new `run_script(script, keys, args)` helper wraps every algorithm's actual script
+  invocation**, replacing each `check()` method's direct `await self._script(keys=.., args=..)`
+  call. It logs (script name + full traceback) and re-raises the exact same exception unchanged on
+  any failure — added purely for diagnostics; it does not change what exception types propagate to
+  `RateLimiterService.check_rate_limit`'s existing fail-open/fail-closed policy.
+- **`tests/conftest.py`'s `redis_client` fixture now calls `register_all_scripts(client)`** right
+  after creating/flushing the client, before yielding — every test that builds a `RateLimiter`
+  directly (bypassing the real app/`lifespan`) needs this, and it also rebinds
+  `AsyncScript.registered_client` to the current test's live connection (the previous test's
+  client is closed in teardown, and `_script_cache` is now keyed by name only, not by client
+  identity, so a stale reference would otherwise point at a closed connection).
 
 ## Running the service
 

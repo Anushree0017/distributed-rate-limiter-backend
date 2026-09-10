@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from api.health import router as health_router
-from api.v1.endpoints import algorithms, rate_limit, redis_health, rules
+from api.v1.endpoints import algorithms, rate_limit, redis_health, rules, scripts
 from core.config_loader import load_rate_limiter_settings
 from core.db import dispose_engine
 from core.exceptions import register_exception_handlers
@@ -14,6 +14,7 @@ from core.logging import setup_logging
 from core.redis_client import create_redis_pool, get_redis_client, ping
 from core.scheduler import shutdown_scheduler, start_scheduler
 from core.settings import get_rate_limit_config_path
+from services.rate_limiter.script_loader import register_all_scripts
 from services.rate_limiter_service import RateLimiterService
 from services.rules_cache import RulesCache
 from services.rules_loader import load_rules_into_cache
@@ -37,6 +38,13 @@ async def lifespan(app: FastAPI):
         )
 
     app.state.redis_client = redis_client
+
+    # Registers every algorithm's Lua script with Redis exactly once, up
+    # front, so no request pays the first-use EVALSHA->NOSCRIPT->SCRIPT LOAD
+    # round trip. Must happen before any RateLimiter is constructed below.
+    registered_scripts = await register_all_scripts(redis_client)
+    logger.info("Registered Lua scripts: %s", ", ".join(registered_scripts))
+
     settings = load_rate_limiter_settings(get_rate_limit_config_path())
 
     # Rules cache must be fully loaded — and this must succeed — *before* the
@@ -88,6 +96,7 @@ app.include_router(rate_limit.router, prefix="/api/v1")
 app.include_router(redis_health.router, prefix="/api/v1")
 app.include_router(rules.router, prefix="/api/v1")
 app.include_router(algorithms.router, prefix="/api/v1")
+app.include_router(scripts.router, prefix="/api/v1")
 app.include_router(health_router)
 register_exception_handlers(app)
 

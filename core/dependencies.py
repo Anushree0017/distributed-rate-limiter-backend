@@ -10,6 +10,7 @@ from services.algorithm_service import AlgorithmService
 from services.rate_limiter_service import RateLimiterService
 from services.rule_service import RuleService
 from services.rules_cache import RulesCache
+from services.script_service import ScriptService
 
 
 def get_rate_limiter_service(request: Request) -> RateLimiterService:
@@ -30,3 +31,7 @@ def get_rule_service(session: AsyncSession = Depends(get_db)) -> RuleService:
 
 def get_algorithm_service(session: AsyncSession = Depends(get_db)) -> AlgorithmService:
     return AlgorithmService(AlgorithmRepository(session))
+
+
+def get_script_service(redis_client: Redis = Depends(get_redis)) -> ScriptService:
+    return ScriptService(redis_client)

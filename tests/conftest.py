@@ -18,6 +18,8 @@ import os
 import pytest_asyncio
 from redis.asyncio import Redis
 
+from services.rate_limiter.script_loader import register_all_scripts
+
 _DEFAULT_TEST_REDIS_URL = "redis://localhost:6379/15"
 
 
@@ -33,6 +35,13 @@ def get_test_redis_url() -> str:
 async def redis_client():
     client = Redis.from_url(get_test_redis_url())
     await client.flushdb()
+    # Scripts are registered once at real app startup (main.py's lifespan);
+    # tests that build RateLimiter instances directly, bypassing the app,
+    # need the same registration done against their own client here. Cheap
+    # even though it re-runs per test — flushdb() doesn't touch Redis's
+    # script cache, so this just rebinds the cached Script objects to this
+    # test's live connection rather than re-uploading anything.
+    await register_all_scripts(client)
     try:
         yield client
     finally:
