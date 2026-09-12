@@ -117,3 +117,102 @@ objects per rule at startup was considered and rejected — rules can be added/c
 between `RulesCache` polls (every `RULES_POLL_INTERVAL_SECONDS`), so pre-built objects would need
 rebuilding on every poll cycle anyway, with no benefit over building them lazily per request; the
 only genuinely one-time, static cost was the script upload, which is what this change front-loads.
+
+---------------------------------------------------------------------------
+
+## Change 4
+
+Two unrelated cleanups requested directly (not pre-planned here beforehand): (a) converted
+`core/settings.py` from a flat module of `os.getenv`-reading functions into a `Settings` class
+exposed as a module-level singleton, and (b) renamed the rules-CRUD and rate-limit-check DTOs used
+by POST/PATCH/PUT endpoints with `RequestDTO`/`ResponseDTO` suffixes, and changed `POST /check` to
+pass its whole DTO into the service layer instead of unpacking it in the controller (matching how
+`POST /rules`/`PATCH /rules/{id}` already worked).
+
+### 4a. `core/settings.py`: functions → `Settings` singleton class
+
+Context: `core/settings.py` was a collection of plain functions (`get_rate_limit_config_path()`,
+`get_redis_url()`, etc.), each calling `os.getenv(...)` fresh on every call — a deliberate choice
+documented in `CLAUDE.md`'s "Deviations from the Phase 2 (Redis) plan" section, specifically so
+tests could `monkeypatch.setenv`/mutate `os.environ` after import and have the very next getter
+call see the new value. Converting to a class per explicit request is a reversal of that
+documented decision; `CLAUDE.md` was updated to record the reversal rather than silently
+contradicting itself.
+
+Implemented:
+
+1. `core/settings.py` now defines a `Settings` class. `__init__` calls `reload()`, which reads
+   every env var (`RATE_LIMIT_CONFIG_PATH`, `REDIS_URL`, `REDIS_MAX_CONNECTIONS`,
+   `REDIS_SOCKET_TIMEOUT_SECONDS`, `REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS`, `DATABASE_URL`,
+   `RULES_POLL_INTERVAL_SECONDS`, and the newly-folded-in `LOG_LEVEL`) once into private instance
+   attributes; each `get_x()` method just returns the cached attribute. A module-level singleton
+   `settings = Settings()` is constructed at the bottom of the module — callers do
+   `from core.settings import settings; settings.get_redis_url()`.
+2. Values are cached at construction, not re-read per call — this is the conventional
+   "settings object" shape, but it breaks the test pattern described above. `reload()` is public
+   specifically so tests can call `settings.reload()` after mutating an env var to force a
+   re-read into the same instance; production code never needs to call it.
+3. `core/logging.py`'s direct `os.getenv("LOG_LEVEL", "INFO")` was folded into `Settings` as
+   `get_log_level()` (already-uppercased by `reload()`), so every env var the app reads now goes
+   through one place.
+4. Every call site was switched from `from core.settings import get_x` + `get_x()` to
+   `from core.settings import settings` + `settings.get_x()`: `core/db.py`,
+   `core/redis_client.py`, `core/scheduler.py`, `scripts/audit_rules_identifier_value.py`,
+   `alembic/env.py`, `main.py` (imported under the alias `env_settings` there, since `main.py`
+   already has a local variable named `settings` — the loaded `RateLimiterSettings` — that would
+   otherwise be shadowed), and `core/logging.py`.
+5. **Tests**: every test that mutates an env var `Settings` reads (`monkeypatch.setenv` or direct
+   `os.environ[...]` assignment) now calls `settings.reload()` immediately afterward, across
+   `test_rules_loader.py`, `test_redis_health.py`, `test_scripts_api.py`, `test_rules_api.py`,
+   `test_health.py`, `test_integration.py`, and `test_scheduler.py`. `conftest.py`'s session-scoped
+   `_point_every_test_at_the_scratch_database` fixture (sets/restores `DATABASE_URL`) calls
+   `settings.reload()` right after each assignment. A new autouse, function-scoped
+   `_reset_settings_after_test` fixture in `conftest.py` calls `settings.reload()` on teardown of
+   every test, so the cached singleton is back in sync with real `os.environ` before the next test
+   starts regardless of what the current test did (monkeypatch reverts the env var automatically
+   on teardown, but doesn't itself call `reload()`).
+
+### 4b. DTO renaming (`RequestDTO`/`ResponseDTO` suffixes) + pass-whole-DTO-to-service
+
+Context: scoped, per explicit request, to POST/PATCH/PUT endpoints only — GET endpoints
+(`list_rules`, `get_rule`, `list_algorithms`, `list_identifier_types`), their query-param DTOs,
+and how they call into the service layer were left untouched.
+
+Implemented:
+
+1. **Renamed** (class names only — files under `dto/` keep their original filenames):
+   `RateLimitCheckRequest` → `RateLimitCheckRequestDTO` (`POST /check`); `RuleCreateRequest` →
+   `RuleCreateRequestDTO` (`POST /rules`); `RuleUpdateRequest` → `RuleUpdateRequestDTO`
+   (`PATCH /rules/{id}`); `RuleResponse` → `RuleResponseDTO` (returned by `POST /rules` and
+   `PATCH /rules/{id}` — also by `GET /rules`/`GET /rules/{id}` as the same shared class, renamed
+   anyway since it's still the response type for the in-scope POST/PATCH endpoints);
+   `AlgorithmSummary` → `AlgorithmSummaryResponseDTO` (nested field on `RuleResponseDTO`);
+   `ScriptReloadResponse` → `ScriptReloadResponseDTO` (`POST /scripts/reload`). Left unrenamed,
+   GET-only: `RuleFilter` (query params for `GET /rules`), `RuleListResponse` (`GET /rules`
+   envelope), `AlgorithmResponse` (`GET /algorithms`), `IdentifierTypeListResponse` (already
+   unused dead code, tied to `GET /rules/identifiers`).
+2. **`rate_limit.py`'s `check_rate_limit`** was the one endpoint that didn't already pass its
+   whole DTO down — it read `payload.endpoint`/`.identifier_value`/`.identifier_type` in the
+   controller and passed three scalars into `RateLimiterService.check_rate_limit`. Changed to
+   `return await service.check_rate_limit(payload)`.
+3. **`RateLimiterService.check_rate_limit`** signature changed from
+   `(self, endpoint: str, identifier_value: str, identifier_type: str)` to
+   `(self, payload: RateLimitCheckRequestDTO)`; the method body now unpacks
+   `payload.endpoint`/`.identifier_value`/`.identifier_type` into locals at the top instead of
+   receiving them as parameters — the rest of the method (`_resolve_limiter`, `ClientIdentifier`
+   construction, the Redis fail-open try/except) is unchanged. `rules.py`'s `create_rule`/
+   `update_rule` already passed their whole DTO into `RuleService`, which already unpacked fields
+   internally — no logic change there, only the renamed type annotations flow through.
+4. **Tests**: `check_rate_limit` was called directly (bypassing the controller/DTO) with scalar
+   kwargs at 15 call sites — `test_rate_limiter_service.py` (8) and
+   `test_rate_limiter_service_rules_cache.py` (7) — each rewritten to construct a
+   `RateLimitCheckRequestDTO` and pass it positionally. `test_integration.py`'s
+   `test_unhandled_exception_returns_generic_500` monkeypatches `check_rate_limit` with a stub;
+   its signature was updated from `async def _boom(self, endpoint, identifier_value,
+   identifier_type)` to `async def _boom(self, payload)` to match. `test_rule_service.py` and the
+   `rules.py`/`scripts.py`/`rule_service.py` imports were updated to the renamed types.
+
+Verified end-to-end against a live server (Redis + Postgres running locally): `POST /check`,
+`POST /rules`, `PATCH /rules/{id}`, `POST /scripts/reload` all return unchanged response shapes —
+this was a rename + internal call-shape refactor, not a wire-format change. Full test suite (122
+tests) passes for both 4a and 4b.

@@ -8,7 +8,7 @@ import uuid
 from sqlalchemy.exc import IntegrityError
 
 from core.exceptions import AlgorithmNotFoundError, RuleNotFoundError, ScopeConflictError, VersionConflictError
-from dto.rule_dto import RuleCreateRequest, RuleFilter, RuleUpdateRequest
+from dto.rule_dto import RuleCreateRequestDTO, RuleFilter, RuleUpdateRequestDTO
 from model.rule import Rule
 from model.rule_status import RuleStatus
 from repositories.algorithm_repository import AlgorithmRepository
@@ -20,7 +20,7 @@ class RuleService:
         self._repository = repository
         self._algorithm_repository = algorithm_repository
 
-    async def create_rule(self, data: RuleCreateRequest) -> Rule:
+    async def create_rule(self, data: RuleCreateRequestDTO) -> Rule:
         if await self._algorithm_repository.get_by_id(data.algorithm_id) is None:
             raise AlgorithmNotFoundError(data.algorithm_id)
 
@@ -48,7 +48,7 @@ class RuleService:
             raise RuleNotFoundError(rule_id)
         return rule
 
-    async def update_rule(self, rule_id: uuid.UUID, data: RuleUpdateRequest) -> Rule:
+    async def update_rule(self, rule_id: uuid.UUID, data: RuleUpdateRequestDTO) -> Rule:
         rule = await self.get_rule(rule_id)
 
         if data.expected_version is not None and data.expected_version != rule.version:

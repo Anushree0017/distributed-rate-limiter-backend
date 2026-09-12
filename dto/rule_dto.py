@@ -6,12 +6,12 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from dto.algorithm_dto import AlgorithmSummary
+from dto.algorithm_dto import AlgorithmSummaryResponseDTO
 from model.rule_identifier_type import RuleIdentifierType
 from model.rule_status import RuleStatus
 
 
-class RuleCreateRequest(BaseModel):
+class RuleCreateRequestDTO(BaseModel):
     endpoint: str
     identifier_type: RuleIdentifierType
     algorithm_id: uuid.UUID
@@ -20,7 +20,7 @@ class RuleCreateRequest(BaseModel):
     created_by: str
 
 
-class RuleUpdateRequest(BaseModel):
+class RuleUpdateRequestDTO(BaseModel):
     """All fields optional except `updated_by`, per the API contract."""
 
     algorithm_id: uuid.UUID | None = None
@@ -31,13 +31,13 @@ class RuleUpdateRequest(BaseModel):
     expected_version: int | None = None
 
 
-class RuleResponse(BaseModel):
+class RuleResponseDTO(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     endpoint: str
     identifier_type: str
-    algorithm: AlgorithmSummary
+    algorithm: AlgorithmSummaryResponseDTO
     params: dict
     status: str
     priority: int
@@ -49,7 +49,7 @@ class RuleResponse(BaseModel):
 
 
 class RuleListResponse(BaseModel):
-    items: list[RuleResponse]
+    items: list[RuleResponseDTO]
     page: int
     page_size: int
     total: int

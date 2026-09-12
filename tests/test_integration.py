@@ -70,7 +70,7 @@ def test_health_returns_ok(monkeypatch):
 
 
 def test_unhandled_exception_returns_generic_500(monkeypatch):
-    async def _boom(self, endpoint, identifier_value, identifier_type):
+    async def _boom(self, payload):
         raise RuntimeError("something exploded")
 
     monkeypatch.setattr(

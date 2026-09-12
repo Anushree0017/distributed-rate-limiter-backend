@@ -10,7 +10,7 @@ something derived from the incoming request/headers.
 from fastapi import APIRouter, Depends
 
 from core.dependencies import get_rate_limiter_service
-from dto.rate_limit_check_request import RateLimitCheckRequest
+from dto.rate_limit_check_request import RateLimitCheckRequestDTO
 from model.rate_limit_result import RateLimitResult
 from services.rate_limiter_service import RateLimiterService
 
@@ -19,7 +19,7 @@ router = APIRouter()
 
 @router.post("/check", response_model=RateLimitResult)
 async def check_rate_limit(
-    payload: RateLimitCheckRequest,
+    payload: RateLimitCheckRequestDTO,
     service: RateLimiterService = Depends(get_rate_limiter_service),
 ) -> RateLimitResult:
-    return await service.check_rate_limit(payload.endpoint, payload.identifier_value, payload.identifier_type)
+    return await service.check_rate_limit(payload)

@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 from model.rule_identifier_type import RuleIdentifierType
 
 
-class RateLimitCheckRequest(BaseModel):
+class RateLimitCheckRequestDTO(BaseModel):
     """Sent by the Gateway before forwarding a real request.
 
     `identifier_type` states which attribute is being sent (client id / api

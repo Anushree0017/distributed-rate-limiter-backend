@@ -2,6 +2,7 @@
 `RulesCache`, never the DB, on the request path — and a DB-defined rule takes
 precedence over the static YAML config for the same endpoint.
 """
+from dto.rate_limit_check_request import RateLimitCheckRequestDTO
 from model.identifier import IdentifierType
 from model.rate_limiter_config import EndpointConfig, RateLimiterSettings
 from model.rule_identifier_type import RuleIdentifierType
@@ -43,10 +44,10 @@ async def test_a_db_rule_overrides_the_static_yaml_config_for_the_same_endpoint(
     # a second request from the same client is denied if (and only if) the
     # cache-sourced rule is actually the one being enforced.
     first = await service.check_rate_limit(
-        endpoint="/checkout", identifier_value="client-1", identifier_type="client_id"
+        RateLimitCheckRequestDTO(endpoint="/checkout", identifier_value="client-1", identifier_type="client_id")
     )
     second = await service.check_rate_limit(
-        endpoint="/checkout", identifier_value="client-1", identifier_type="client_id"
+        RateLimitCheckRequestDTO(endpoint="/checkout", identifier_value="client-1", identifier_type="client_id")
     )
     assert first.allowed is True
     assert second.allowed is False
@@ -60,9 +61,11 @@ async def test_a_different_identifier_type_on_the_same_endpoint_resolves_indepen
     # A request declaring identifier_type="api_key" has no matching DB rule
     # and no global rule for this endpoint -> falls back to the static YAML
     # config (limit 100), so it is not denied on request 2.
-    await service.check_rate_limit(endpoint="/checkout", identifier_value="key-1", identifier_type="api_key")
+    await service.check_rate_limit(
+        RateLimitCheckRequestDTO(endpoint="/checkout", identifier_value="key-1", identifier_type="api_key")
+    )
     second = await service.check_rate_limit(
-        endpoint="/checkout", identifier_value="key-1", identifier_type="api_key"
+        RateLimitCheckRequestDTO(endpoint="/checkout", identifier_value="key-1", identifier_type="api_key")
     )
     assert second.allowed is True
 
@@ -76,10 +79,10 @@ async def test_a_global_rule_applies_when_no_exact_type_rule_matches(redis_clien
     service = RateLimiterService(_settings(), redis_client, rules_cache=cache)
 
     first = await service.check_rate_limit(
-        endpoint="/checkout", identifier_value="anyone", identifier_type="client_id"
+        RateLimitCheckRequestDTO(endpoint="/checkout", identifier_value="anyone", identifier_type="client_id")
     )
     second = await service.check_rate_limit(
-        endpoint="/checkout", identifier_value="anyone", identifier_type="client_id"
+        RateLimitCheckRequestDTO(endpoint="/checkout", identifier_value="anyone", identifier_type="client_id")
     )
     assert first.allowed is True
     assert second.allowed is False
@@ -91,7 +94,7 @@ async def test_falls_back_to_static_config_when_no_rule_at_all_matches(redis_cli
     service = RateLimiterService(_settings(), redis_client, rules_cache=cache)
 
     result = await service.check_rate_limit(
-        endpoint="/checkout", identifier_value="client-1", identifier_type="client_id"
+        RateLimitCheckRequestDTO(endpoint="/checkout", identifier_value="client-1", identifier_type="client_id")
     )
     assert result.allowed is True
 
@@ -103,7 +106,7 @@ async def test_unusable_rule_falls_back_instead_of_raising(redis_client):
     service = RateLimiterService(_settings(), redis_client, rules_cache=cache)
 
     result = await service.check_rate_limit(
-        endpoint="/checkout", identifier_value="client-1", identifier_type="client_id"
+        RateLimitCheckRequestDTO(endpoint="/checkout", identifier_value="client-1", identifier_type="client_id")
     )
     assert result.allowed is True
 
@@ -112,7 +115,7 @@ async def test_no_rules_cache_behaves_exactly_like_before_this_feature(redis_cli
     service = RateLimiterService(_settings(), redis_client, rules_cache=None)
 
     result = await service.check_rate_limit(
-        endpoint="/checkout", identifier_value="client-1", identifier_type="client_id"
+        RateLimitCheckRequestDTO(endpoint="/checkout", identifier_value="client-1", identifier_type="client_id")
     )
     assert result.allowed is True
 

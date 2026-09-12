@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from core.exceptions import AlgorithmNotFoundError, RuleNotFoundError, ScopeConflictError, VersionConflictError
-from dto.rule_dto import RuleCreateRequest, RuleUpdateRequest
+from dto.rule_dto import RuleCreateRequestDTO, RuleUpdateRequestDTO
 from model.rule import Rule
 from model.rule_status import RuleStatus
 from services.rule_service import RuleService
@@ -37,7 +37,7 @@ async def test_create_rejects_unknown_algorithm():
     algorithm_repo.get_by_id.return_value = None
     service = _service(algorithm_repo=algorithm_repo)
 
-    request = RuleCreateRequest(
+    request = RuleCreateRequestDTO(
         endpoint="/checkout",
         identifier_type="user_id",
         algorithm_id=uuid.uuid4(),
@@ -54,7 +54,7 @@ async def test_create_maps_db_race_to_scope_conflict():
     rule_repo.create.side_effect = IntegrityError("stmt", {}, Exception("dup"))
     service = _service(rule_repo, algorithm_repo)
 
-    request = RuleCreateRequest(
+    request = RuleCreateRequestDTO(
         endpoint="/checkout",
         identifier_type="user_id",
         algorithm_id=uuid.uuid4(),
@@ -79,7 +79,7 @@ async def test_update_rejects_version_mismatch():
     service = _service(rule_repo)
 
     with pytest.raises(VersionConflictError):
-        await service.update_rule(uuid.uuid4(), RuleUpdateRequest(updated_by="jane.doe", expected_version=2))
+        await service.update_rule(uuid.uuid4(), RuleUpdateRequestDTO(updated_by="jane.doe", expected_version=2))
 
 
 async def test_update_activating_rule_checks_for_scope_conflict():
@@ -89,7 +89,7 @@ async def test_update_activating_rule_checks_for_scope_conflict():
     service = _service(rule_repo)
 
     with pytest.raises(ScopeConflictError):
-        await service.update_rule(uuid.uuid4(), RuleUpdateRequest(updated_by="jane.doe", status="active"))
+        await service.update_rule(uuid.uuid4(), RuleUpdateRequestDTO(updated_by="jane.doe", status="active"))
 
 
 async def test_update_bumps_version_and_sets_updated_by():
@@ -100,7 +100,7 @@ async def test_update_bumps_version_and_sets_updated_by():
     rule_repo.update.side_effect = lambda r: r
     service = _service(rule_repo)
 
-    updated = await service.update_rule(rule.id, RuleUpdateRequest(updated_by="jane.doe", priority=50))
+    updated = await service.update_rule(rule.id, RuleUpdateRequestDTO(updated_by="jane.doe", priority=50))
 
     assert updated.version == 2
     assert updated.priority == 50

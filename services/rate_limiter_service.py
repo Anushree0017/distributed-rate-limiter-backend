@@ -6,6 +6,7 @@ from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
+from dto.rate_limit_check_request import RateLimitCheckRequestDTO
 from interfaces.base import RateLimiter
 from model.identifier import ClientIdentifier, IdentifierType
 from model.rate_limit_result import RateLimitResult
@@ -145,9 +146,7 @@ class RateLimiterService:
         limiter = RateLimiterFactory.create(config, self._redis_client, scope=f"rule:{rule['id']}")
         return limiter, identifier_type
 
-    async def check_rate_limit(
-        self, endpoint: str, identifier_value: str, identifier_type: str
-    ) -> RateLimitResult:
+    async def check_rate_limit(self, payload: RateLimitCheckRequestDTO) -> RateLimitResult:
         """Resolve the limiter for `(endpoint, identifier_type)` — a matching
         DB rule if one exists, otherwise the static YAML `default` fallback —
         and check `identifier_value` against it. The gateway now states
@@ -166,6 +165,11 @@ class RateLimiterService:
           to the API layer's generic exception handler (500), rather than
           silently failing open and masking the problem.
         """
+        endpoint, identifier_value, identifier_type = (
+            payload.endpoint,
+            payload.identifier_value,
+            payload.identifier_type,
+        )
         limiter, resolved_identifier_type = self._resolve_limiter(
             endpoint, identifier_type, self._default.limiter
         )

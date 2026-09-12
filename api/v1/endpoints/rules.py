@@ -6,7 +6,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query, status
 
 from core.dependencies import get_rule_service
-from dto.rule_dto import RuleCreateRequest, RuleFilter, RuleListResponse, RuleResponse, RuleUpdateRequest
+from dto.rule_dto import RuleCreateRequestDTO, RuleFilter, RuleListResponse, RuleResponseDTO, RuleUpdateRequestDTO
 from model.rule_identifier_type import RuleIdentifierType
 from model.rule_status import RuleStatus
 from services.rule_service import RuleService
@@ -39,33 +39,33 @@ async def list_rules(
     )
     items, total = await service.list_rules(filters)
     return RuleListResponse(
-        items=[RuleResponse.model_validate(rule) for rule in items],
+        items=[RuleResponseDTO.model_validate(rule) for rule in items],
         page=page,
         page_size=page_size,
         total=total,
     )
 
 
-@router.get("/{rule_id}", response_model=RuleResponse)
-async def get_rule(rule_id: uuid.UUID, service: RuleService = Depends(get_rule_service)) -> RuleResponse:
+@router.get("/{rule_id}", response_model=RuleResponseDTO)
+async def get_rule(rule_id: uuid.UUID, service: RuleService = Depends(get_rule_service)) -> RuleResponseDTO:
     rule = await service.get_rule(rule_id)
-    return RuleResponse.model_validate(rule)
+    return RuleResponseDTO.model_validate(rule)
 
 
-@router.post("", response_model=RuleResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=RuleResponseDTO, status_code=status.HTTP_201_CREATED)
 async def create_rule(
-    payload: RuleCreateRequest, service: RuleService = Depends(get_rule_service)
-) -> RuleResponse:
+    payload: RuleCreateRequestDTO, service: RuleService = Depends(get_rule_service)
+) -> RuleResponseDTO:
     rule = await service.create_rule(payload)
-    return RuleResponse.model_validate(rule)
+    return RuleResponseDTO.model_validate(rule)
 
 
-@router.patch("/{rule_id}", response_model=RuleResponse)
+@router.patch("/{rule_id}", response_model=RuleResponseDTO)
 async def update_rule(
-    rule_id: uuid.UUID, payload: RuleUpdateRequest, service: RuleService = Depends(get_rule_service)
-) -> RuleResponse:
+    rule_id: uuid.UUID, payload: RuleUpdateRequestDTO, service: RuleService = Depends(get_rule_service)
+) -> RuleResponseDTO:
     rule = await service.update_rule(rule_id, payload)
-    return RuleResponse.model_validate(rule)
+    return RuleResponseDTO.model_validate(rule)
 
 
 @router.delete("/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -2,5 +2,5 @@
 from pydantic import BaseModel
 
 
-class ScriptReloadResponse(BaseModel):
+class ScriptReloadResponseDTO(BaseModel):
     registered_scripts: list[str]

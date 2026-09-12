@@ -35,6 +35,6 @@ class Rule(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    # Eagerly joined by the repository (`selectinload`) so `RuleResponse` can
+    # Eagerly joined by the repository (`selectinload`) so `RuleResponseDTO` can
     # nest `{id, name}` without a second round-trip per row.
     algorithm: Mapped["Algorithm"] = relationship(lazy="raise")

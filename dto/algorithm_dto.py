@@ -13,8 +13,8 @@ class AlgorithmResponse(BaseModel):
     param_schema: dict = {}
 
 
-class AlgorithmSummary(BaseModel):
-    """Nested inside `RuleResponse` — id + name only, for UI convenience."""
+class AlgorithmSummaryResponseDTO(BaseModel):
+    """Nested inside `RuleResponseDTO` — id + name only, for UI convenience."""
 
     model_config = ConfigDict(from_attributes=True)
 
