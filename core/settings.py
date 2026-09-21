@@ -13,6 +13,7 @@ _DEFAULT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = 2.0
 _DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/rate_limiter"
 _DEFAULT_RULES_POLL_INTERVAL_SECONDS = 900
 _DEFAULT_LOG_LEVEL = "INFO"
+_IDENTIFIER_HASH_SECRET_MIN_LENGTH = 32
 
 
 class Settings:
@@ -42,6 +43,26 @@ class Settings:
             os.getenv("RULES_POLL_INTERVAL_SECONDS", _DEFAULT_RULES_POLL_INTERVAL_SECONDS)
         )
         self._log_level = os.getenv("LOG_LEVEL", _DEFAULT_LOG_LEVEL).upper()
+        self._identifier_hash_secret = self._read_identifier_hash_secret()
+
+    @staticmethod
+    def _read_identifier_hash_secret() -> str:
+        """Hard-fail (same stance as Redis/Postgres reachability) rather than
+        silently defaulting: every app instance sharing one Redis must use
+        the identical secret, or instances compute different digests for the
+        same identifiers and multi-instance correctness silently breaks. No
+        rotation support in this phase — changing the secret resets every
+        live rate-limit counter.
+        """
+        secret = os.getenv("IDENTIFIER_HASH_SECRET")
+        if not secret or len(secret) < _IDENTIFIER_HASH_SECRET_MIN_LENGTH:
+            raise RuntimeError(
+                "IDENTIFIER_HASH_SECRET must be set and at least "
+                f"{_IDENTIFIER_HASH_SECRET_MIN_LENGTH} characters long (used to HMAC-hash "
+                "identifier values into Redis keys). Every app instance sharing one Redis "
+                "must use the same value."
+            )
+        return secret
 
     def get_rate_limit_config_path(self) -> str:
         return self._rate_limit_config_path
@@ -83,6 +104,10 @@ class Settings:
 
     def get_log_level(self) -> str:
         return self._log_level
+
+    def get_identifier_hash_secret(self) -> str:
+        """Never log this value. See `core/key_hasher.py`."""
+        return self._identifier_hash_secret
 
 
 settings = Settings()

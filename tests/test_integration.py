@@ -25,8 +25,7 @@ def test_check_allows_then_blocks_with_retry_after(tmp_path, monkeypatch):
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
     settings.reload()
     payload = {
-        "identifier_value": "integration-client",
-        "identifier_type": "client_id",
+        "identifiers": [{"type": "client_id", "value": "integration-client"}],
         "endpoint": "/api/v1/orders",
     }
 
@@ -55,7 +54,7 @@ def test_check_rejects_missing_fields(monkeypatch):
     settings.reload()
     with TestClient(app) as client:
         response = client.post(
-            "/api/v1/check", json={"identifier_value": "alice", "identifier_type": "client_id"}
+            "/api/v1/check", json={"identifiers": [{"type": "client_id", "value": "alice"}]}
         )
     assert response.status_code == 422
 
@@ -82,7 +81,7 @@ def test_unhandled_exception_returns_generic_500(monkeypatch):
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post(
             "/api/v1/check",
-            json={"identifier_value": "alice", "identifier_type": "client_id", "endpoint": "/api/v1/orders"},
+            json={"identifiers": [{"type": "client_id", "value": "alice"}], "endpoint": "/api/v1/orders"},
         )
 
     assert response.status_code == 500

@@ -1,13 +1,15 @@
 """ORM model for `rules` — one row per active/inactive rate-limit rule for a
-given (endpoint, identifier_type) scope. See `db_schema.sql` for the DDL this
-mirrors, including `ux_rules_active_scope` and the `updated_at`-touching
-trigger (both DB-level concerns with no ORM-side equivalent needed here).
+given (endpoint, identifier_signature) scope, where identifier_signature is
+derived from 1-3 identifier_types (composite identifiers, Phase 5). See
+`db_schema.sql` for the original DDL this mirrors, including
+`ux_rules_active_scope` and the `updated_at`-touching trigger (both DB-level
+concerns with no ORM-side equivalent needed here).
 """
 import uuid
 from datetime import datetime
 
 from sqlalchemy import ForeignKey, Integer, String, DateTime, func, text
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from core.db import Base
@@ -22,7 +24,14 @@ class Rule(Base):
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
     endpoint: Mapped[str] = mapped_column(String, nullable=False)
-    identifier_type: Mapped[str] = mapped_column(String, nullable=False)
+    # Canonical (deduplicated, alphabetically sorted) identifier types this
+    # rule is scoped to — 1 to 3 of them (MAX_IDENTIFIERS_PER_RULE), `global`
+    # always alone. `identifier_signature` is `'+'.join(identifier_types)`,
+    # the uniqueness key alongside `endpoint`. `services/rule_service.py`
+    # (via `model.rule_identifier_type.normalize_identifier_types`) is the
+    # only writer of both — never set independently.
+    identifier_types: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False)
+    identifier_signature: Mapped[str] = mapped_column(String, nullable=False)
     algorithm_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("algorithms.id"), nullable=False
     )

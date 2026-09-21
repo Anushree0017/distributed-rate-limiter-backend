@@ -7,12 +7,19 @@ import uuid
 
 from sqlalchemy.exc import IntegrityError
 
-from core.exceptions import AlgorithmNotFoundError, RuleNotFoundError, ScopeConflictError, VersionConflictError
+from core.exceptions import (
+    AlgorithmNotFoundError,
+    InvalidRuleParamsError,
+    RuleNotFoundError,
+    ScopeConflictError,
+    VersionConflictError,
+)
 from dto.rule_dto import RuleCreateRequestDTO, RuleFilter, RuleUpdateRequestDTO
 from model.rule import Rule
 from model.rule_status import RuleStatus
 from repositories.algorithm_repository import AlgorithmRepository
 from repositories.rule_repository import RuleRepository
+from services.rule_algorithm_mapper import UnsupportedRuleAlgorithmError, build_algorithm_config
 
 
 class RuleService:
@@ -20,13 +27,23 @@ class RuleService:
         self._repository = repository
         self._algorithm_repository = algorithm_repository
 
+    async def _validate_params_or_raise(self, algorithm_id: uuid.UUID, params: dict) -> None:
+        algorithm = await self._algorithm_repository.get_by_id(algorithm_id)
+        if algorithm is None:
+            raise AlgorithmNotFoundError(algorithm_id)
+        try:
+            build_algorithm_config(algorithm.name, params)
+        except (UnsupportedRuleAlgorithmError, KeyError, TypeError, ValueError) as exc:
+            raise InvalidRuleParamsError(algorithm.name, str(exc))
+
     async def create_rule(self, data: RuleCreateRequestDTO) -> Rule:
-        if await self._algorithm_repository.get_by_id(data.algorithm_id) is None:
-            raise AlgorithmNotFoundError(data.algorithm_id)
+        await self._validate_params_or_raise(data.algorithm_id, data.params)
+        identifier_types, identifier_signature = data.normalized_identifier_types()
 
         rule = Rule(
             endpoint=data.endpoint,
-            identifier_type=data.identifier_type.value,
+            identifier_types=identifier_types,
+            identifier_signature=identifier_signature,
             algorithm_id=data.algorithm_id,
             params=data.params,
             status=RuleStatus.ACTIVE.value,
@@ -40,7 +57,7 @@ class RuleService:
             # Race-condition backstop: `ux_rules_active_scope` (db_schema.sql)
             # rejected a concurrent duplicate that slipped past no pre-check
             # here (create has no "existing row" to pre-check against).
-            raise ScopeConflictError(data.endpoint, data.identifier_type.value)
+            raise ScopeConflictError(data.endpoint, identifier_signature)
 
     async def get_rule(self, rule_id: uuid.UUID) -> Rule:
         rule = await self._repository.get_by_id(rule_id)
@@ -54,8 +71,10 @@ class RuleService:
         if data.expected_version is not None and data.expected_version != rule.version:
             raise VersionConflictError(rule_id, data.expected_version, rule.version)
 
-        if data.algorithm_id is not None and await self._algorithm_repository.get_by_id(data.algorithm_id) is None:
-            raise AlgorithmNotFoundError(data.algorithm_id)
+        new_algorithm_id = data.algorithm_id if data.algorithm_id is not None else rule.algorithm_id
+        if data.algorithm_id is not None or data.params is not None:
+            new_params = data.params if data.params is not None else rule.params
+            await self._validate_params_or_raise(new_algorithm_id, new_params)
 
         # Resolve every candidate value into locals first, and only assign
         # them onto `rule` once we're done validating — `rule` is already
@@ -67,10 +86,10 @@ class RuleService:
 
         if new_status == RuleStatus.ACTIVE.value:
             conflict = await self._repository.find_active_conflict(
-                rule.endpoint, rule.identifier_type, exclude_id=rule.id
+                rule.endpoint, rule.identifier_signature, exclude_id=rule.id
             )
             if conflict is not None:
-                raise ScopeConflictError(rule.endpoint, rule.identifier_type)
+                raise ScopeConflictError(rule.endpoint, rule.identifier_signature)
 
         if data.algorithm_id is not None:
             rule.algorithm_id = data.algorithm_id
@@ -85,7 +104,7 @@ class RuleService:
         try:
             return await self._repository.update(rule)
         except IntegrityError:
-            raise ScopeConflictError(rule.endpoint, rule.identifier_type)
+            raise ScopeConflictError(rule.endpoint, rule.identifier_signature)
 
     async def delete_rule(self, rule_id: uuid.UUID) -> None:
         rule = await self.get_rule(rule_id)

@@ -40,7 +40,8 @@ async def test_fetch_all_rules_from_db_returns_plain_dicts(db_session):
     await RuleRepository(db_session).create(
         Rule(
             endpoint="/checkout",
-            identifier_type="user_id",
+            identifier_types=["user_id"],
+            identifier_signature="user_id",
             algorithm_id=algorithm.id,
             params={"limit": 5},
             status=RuleStatus.ACTIVE.value,
@@ -70,7 +71,8 @@ async def test_load_rules_into_cache_replaces_cache_and_returns_rules(db_session
     await RuleRepository(db_session).create(
         Rule(
             endpoint="/checkout",
-            identifier_type="user_id",
+            identifier_types=["user_id"],
+            identifier_signature="user_id",
             algorithm_id=algorithm.id,
             params={"limit": 5},
             status=RuleStatus.ACTIVE.value,
@@ -85,12 +87,16 @@ async def test_load_rules_into_cache_replaces_cache_and_returns_rules(db_session
     loaded = await load_rules_into_cache(cache)
 
     assert len(loaded) == 1
-    assert cache.get_by_lookup_key("/checkout", "user_id") is not None
+    assert cache.get_candidates("/checkout") != []
 
 
 async def test_load_rules_into_cache_raises_on_failure(monkeypatch):
+    from model.identifier import IdentifierType
+
     cache = RulesCache()
-    cache.load_all([{"id": "keep-me", "endpoint": "/x", "identifier_type": "global",
+    cache.load_all([{"id": "keep-me", "endpoint": "/x", "identifier_types": ["global"],
+                      "identifier_signature": "global", "is_global": True,
+                      "engine_identifier_types": frozenset({IdentifierType.ENDPOINT}),
                       "algorithm_id": "a", "algorithm_name": "FixedWindow",
                       "params": {}, "status": "active", "priority": 100, "version": 1}])
 

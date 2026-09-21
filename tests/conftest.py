@@ -18,9 +18,25 @@ import os
 import pytest_asyncio
 from redis.asyncio import Redis
 
+from core.key_hasher import KeyHasher
+from model.identifier import ClientIdentifier, IdentifierType, build_client_identifier
 from services.rate_limiter.script_loader import register_all_scripts
 
 _DEFAULT_TEST_REDIS_URL = "redis://localhost:6379/15"
+
+# Fixed test-only hasher — algorithm-level tests care about key *isolation*
+# (same identifier -> same key, different identifier -> different key), not
+# about the actual hash value, so any 32+ char secret works here.
+_TEST_HASHER = KeyHasher("test-secret-at-least-32-characters-long")
+
+
+def make_client_identifier(value: str, identifier_type: IdentifierType = IdentifierType.CLIENT_ID) -> ClientIdentifier:
+    """Test helper: builds a single-identifier `ClientIdentifier` the way
+    `RateLimiterService` does, without every algorithm-level test needing its
+    own `KeyHasher`. Pre-Phase-5 tests just want two different `value`s to
+    produce two different, isolated Redis keys.
+    """
+    return build_client_identifier([(identifier_type, value)], _TEST_HASHER)
 
 
 def get_test_redis_url() -> str:

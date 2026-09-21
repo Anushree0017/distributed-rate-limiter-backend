@@ -14,9 +14,11 @@ async def _an_algorithm_id(db_session):
 
 
 def _make_rule(algorithm_id, **overrides) -> Rule:
+    identifier_types = overrides.pop("identifier_types", None) or [overrides.pop("identifier_type", "user_id")]
     defaults = dict(
         endpoint="/checkout",
-        identifier_type="user_id",
+        identifier_types=identifier_types,
+        identifier_signature="+".join(sorted(identifier_types)),
         algorithm_id=algorithm_id,
         params={"limit": 100},
         status=RuleStatus.ACTIVE.value,

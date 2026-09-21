@@ -1,6 +1,6 @@
 import asyncio
 
-from model.identifier import ClientIdentifier
+from tests.conftest import make_client_identifier
 from services.rate_limiter.token_bucket import TokenBucketLimiter
 
 
@@ -8,7 +8,7 @@ async def test_allows_up_to_capacity_then_blocks(redis_client):
     limiter = TokenBucketLimiter(
         capacity=2, refill_rate_per_second=0.001, redis_client=redis_client, scope="test"
     )
-    identifier = ClientIdentifier(value="client-1")
+    identifier = make_client_identifier("client-1")
 
     assert (await limiter.check(identifier)).allowed is True
     assert (await limiter.check(identifier)).allowed is True
@@ -23,7 +23,7 @@ async def test_refills_over_time(redis_client):
     limiter = TokenBucketLimiter(
         capacity=1, refill_rate_per_second=10.0, redis_client=redis_client, scope="test"
     )
-    identifier = ClientIdentifier(value="client-1")
+    identifier = make_client_identifier("client-1")
 
     assert (await limiter.check(identifier)).allowed is True
     assert (await limiter.check(identifier)).allowed is False
@@ -36,7 +36,7 @@ async def test_key_has_a_ttl(redis_client):
     limiter = TokenBucketLimiter(
         capacity=5, refill_rate_per_second=1.0, redis_client=redis_client, scope="test"
     )
-    identifier = ClientIdentifier(value="client-1")
+    identifier = make_client_identifier("client-1")
 
     await limiter.check(identifier)
 
@@ -48,7 +48,7 @@ async def test_concurrent_requests_do_not_over_allow(redis_client):
     limiter = TokenBucketLimiter(
         capacity=10, refill_rate_per_second=0.0001, redis_client=redis_client, scope="test"
     )
-    identifier = ClientIdentifier(value="concurrent-client")
+    identifier = make_client_identifier("concurrent-client")
 
     results = await asyncio.gather(*(limiter.check(identifier) for _ in range(30)))
 

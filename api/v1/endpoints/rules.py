@@ -23,6 +23,7 @@ async def list_identifier_types() -> dict:
 async def list_rules(
     endpoint: str | None = Query(default=None),
     identifier_type: RuleIdentifierType | None = Query(default=None),
+    identifier_signature: str | None = Query(default=None),
     status_: RuleStatus | None = Query(default=None, alias="status"),
     algorithm_id: uuid.UUID | None = Query(default=None),
     page: int = Query(default=1, ge=1),
@@ -32,6 +33,7 @@ async def list_rules(
     filters = RuleFilter(
         endpoint=endpoint,
         identifier_type=identifier_type,
+        identifier_signature=identifier_signature,
         status=status_,
         algorithm_id=algorithm_id,
         page=page,

@@ -12,10 +12,12 @@ from services.rule_service import RuleService
 
 
 def _rule(**overrides) -> Rule:
+    identifier_types = overrides.pop("identifier_types", None) or [overrides.pop("identifier_type", "user_id")]
     defaults = dict(
         id=uuid.uuid4(),
         endpoint="/checkout",
-        identifier_type="user_id",
+        identifier_types=identifier_types,
+        identifier_signature="+".join(sorted(identifier_types)),
         algorithm_id=uuid.uuid4(),
         params={"limit": 100},
         status=RuleStatus.ACTIVE.value,
@@ -39,7 +41,7 @@ async def test_create_rejects_unknown_algorithm():
 
     request = RuleCreateRequestDTO(
         endpoint="/checkout",
-        identifier_type="user_id",
+        identifier_types=["user_id"],
         algorithm_id=uuid.uuid4(),
         created_by="jane.doe",
     )
@@ -48,16 +50,19 @@ async def test_create_rejects_unknown_algorithm():
 
 
 async def test_create_maps_db_race_to_scope_conflict():
+    algorithm = AsyncMock()
+    algorithm.name = "FixedWindow"
     algorithm_repo = AsyncMock()
-    algorithm_repo.get_by_id.return_value = object()
+    algorithm_repo.get_by_id.return_value = algorithm
     rule_repo = AsyncMock()
     rule_repo.create.side_effect = IntegrityError("stmt", {}, Exception("dup"))
     service = _service(rule_repo, algorithm_repo)
 
     request = RuleCreateRequestDTO(
         endpoint="/checkout",
-        identifier_type="user_id",
+        identifier_types=["user_id"],
         algorithm_id=uuid.uuid4(),
+        params={"limit": 100, "window_seconds": 60},
         created_by="jane.doe",
     )
     with pytest.raises(ScopeConflictError):

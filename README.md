@@ -128,7 +128,13 @@ keys are never evicted early under memory pressure — see redis_guidelines.md �
 
 ```
 REDIS_URL=redis://localhost:6379/0
+IDENTIFIER_HASH_SECRET=<a random string, at least 32 characters>
 ```
+
+`IDENTIFIER_HASH_SECRET` HMAC-hashes identifier values into Redis keys (see "Composite
+identifiers" below) — the app **will not start** without it, same stance as `REDIS_URL`. Generate
+one with e.g. `python3 -c "import secrets; print(secrets.token_hex(32))"`. Every app instance
+sharing one Redis must use the identical value.
 
 Optional pool tuning (sane defaults if unset):
 
@@ -144,14 +150,16 @@ app starts serving) — distinct from the steady-state fail-open behavior below,
 
 ### Key naming and TTL
 
-Every key is named `rl:{algorithm}:{scope}:{identifier_type}:{identifier_value}`, where `scope`
-is the endpoint path the limiter was configured for (or `__default__` for the fallback limiter) —
-this is what keeps two endpoints sharing an identical algorithm+config from pooling the same
-rate-limit state, mirroring how separate in-memory instances kept them isolated before Redis.
-Predictable and greppable via `redis-cli`, e.g.:
+Every key is named `rl:{algorithm}:{scope}:{key_signature}:{digest}`, where `scope` is
+`rule:{rule_id}` for a DB-rule-backed limiter (or `__default__` for the static fallback),
+`key_signature` is the sorted `+`-joined identifier type names actually used (e.g. `api_key`,
+`api_key+ip`), and `digest` is a 32-hex-char truncated HMAC-SHA256 of the identifier value(s) —
+see "Composite identifiers" below. Raw identifier values (API keys, IPs, ...) never appear in the
+key. Greppable by prefix via `redis-cli` (the digest itself isn't predictable from outside the
+app):
 
 ```bash
-redis-cli KEYS 'rl:token_bucket:/api/v1/orders:*'
+redis-cli KEYS 'rl:token_bucket:rule:*:api_key:*'
 ```
 
 Every key's TTL is set inside the same Lua script that writes it, sized to that algorithm's own
@@ -224,12 +232,21 @@ curl -s http://127.0.0.1:8000/api/v1/redis/health
 
 ### `POST /api/v1/check`
 
-Body: `{"endpoint": "<endpoint path being requested>", "identifier_type": "<rule identifier type>", "identifier_value": "<caller identifier>"}`.
-`identifier_type` states which attribute is being sent (`client_id` / `api_key` / `ip` / ...,
-same vocabulary as a rule's `identifier_type`) and drives rule lookup — matching is a direct
-`(endpoint, identifier_type)` cache hit. `identifier_value` is that attribute's raw value; it
-never participates in rule matching, only in building the per-caller Redis key. The Gateway is
-expected to already know both, from the same shared config.
+Body: `{"endpoint": "...", "identifiers": [{"type": "api_key", "value": "..."}, {"type": "ip_address", "value": "..."}]}`
+— 1 to 3 `{type, value}` entries, no duplicate types. `type` is the runtime `IdentifierType`
+vocabulary. Drives rule resolution by matching each active rule's identifier-type set against the
+types actually provided: the most specific matching rule wins (e.g. a rule scoped to `{api_key,
+ip}` beats one scoped to just `{api_key}` when both are provided; if `ip` is missing, it falls back
+to the `{api_key}` rule, then the endpoint's `global` rule, then the static default).
+
+> The pre-Phase-5 single-identifier `identifier_type`/`identifier_value` request pair has been
+> **removed** — `identifiers` is the only accepted shape now. If you're integrating a caller that
+> still sends the old shape (e.g. an unmigrated gateway), see
+> `.claude/plans/phase5/plan.md`'s "TODO before the next deployment".
+
+Every value is validated per its type (`model/identifier_validation.py`) and never used raw in a
+Redis key — it's HMAC-hashed (`IDENTIFIER_HASH_SECRET`, see below) into the key instead. A
+malformed value returns `422` naming the type and a reason, never the value itself.
 
 Always returns `200` with a `RateLimitResult` body — this service reports the decision, it
 doesn't enforce it. The caller (the API gateway) is responsible for rejecting the original
@@ -238,15 +255,23 @@ request when `allowed` is `false`.
 ```bash
 curl -i -X POST http://127.0.0.1:8000/api/v1/check \
   -H "Content-Type: application/json" \
-  -d '{"endpoint": "/api/v1/orders", "identifier_type": "api_key", "identifier_value": "api-key-abc123"}'
-
-curl -i -X POST http://127.0.0.1:8000/api/v1/check \
-  -H "Content-Type: application/json" \
-  -d '{"endpoint": "/api/v1/public-search", "identifier_type": "ip", "identifier_value": "203.0.113.7"}'
+  -d '{"endpoint": "/api/v1/orders", "identifiers": [{"type": "api_key", "value": "api-key-abc123"}, {"type": "ip_address", "value": "203.0.113.7"}]}'
 ```
 
-`endpoint` is matched against the YAML config's `endpoints` keys; if there's no entry for it,
-the `default` algorithm and `identifier_type` are used.
+`endpoint` is matched against active DB rules first (see "How rules reach `/check`" below); if
+none match, the static YAML `default` is used.
+
+### Composite identifiers (Phase 5)
+
+- A rule can be scoped to 1-3 identifier types at once (`rules.identifier_types`,
+  `MAX_IDENTIFIERS_PER_RULE = 3` in `model/rule_identifier_type.py`); `global` must always be
+  alone. `rules.identifier_signature` (`'+'.join(sorted(identifier_types))`) is the uniqueness key
+  alongside `endpoint`.
+- `IDENTIFIER_HASH_SECRET` (env var, required, ≥32 characters) is the HMAC key used to hash
+  identifier values into Redis keys — the app **will not start** without it. Every app instance
+  sharing one Redis **must use the identical secret**, or instances compute different keys for the
+  same identifiers and multi-instance correctness silently breaks. Changing the secret resets
+  every live rate-limit counter (no rotation support in this phase).
 
 See "Fail-open / fail-closed policy" above for what happens when Redis itself is the problem.
 Any other unhandled exception in the request path returns a generic
@@ -349,7 +374,7 @@ writes to it directly).
 
 | Method & path              | Purpose |
 |-----------------------------|---------|
-| `GET /rules`                 | List rules, filterable by `endpoint`, `identifier_type`, `status`, `algorithm_id`; paginated (`page`, `page_size`, max 100) |
+| `GET /rules`                 | List rules, filterable by `endpoint`, `identifier_type` (legacy single-type, matches `identifier_signature` equality), `identifier_signature`, `status`, `algorithm_id`; paginated (`page`, `page_size`, max 100) |
 | `GET /rules/{id}`             | Fetch one rule |
 | `POST /rules`                 | Create a rule (`status` defaults to `active`, `version` to `1`) |
 | `PATCH /rules/{id}`           | Partial update (`params`, `priority`, `status`, `algorithm_id`); `expected_version` enables optimistic concurrency |
@@ -360,27 +385,39 @@ writes to it directly).
 ```bash
 curl -s http://127.0.0.1:8000/api/v1/algorithms
 
+# 1-3 identifier types; "global" must be alone
 curl -s -X POST http://127.0.0.1:8000/api/v1/rules \
   -H "Content-Type: application/json" \
   -d '{
     "endpoint": "/checkout",
-    "identifier_type": "user_id",
+    "identifier_types": ["api_key", "ip"],
     "algorithm_id": "<uuid from /algorithms>",
     "params": {"limit": 100, "window_seconds": 60},
     "created_by": "jane.doe"
   }'
 ```
 
-A rule is a generic policy for an `identifier_type` on an `endpoint`, not a specific caller
-instance — there's no field to target one particular user/key/IP value. Only one **active** rule
-can exist per `(endpoint, identifier_type)` scope — enforced by a partial unique index in
-Postgres (`ux_rules_active_scope`) and pre-checked in the service layer for a specific error
-message; a deactivated/deleted rule never blocks a new active one in the same scope.
+> The pre-Phase-5 singular `identifier_type` field on rule creation has been **removed** —
+> `identifier_types` (a list) is the only accepted shape now. `GET /rules`'s legacy `identifier_type`
+> *query filter* is unrelated and still works (see the table above).
 
-Note: this rule-definition `identifier_type` is unrelated to (but shares a name with) the
-`identifier_type`/`identifier_value` fields on the `/check` request above — the `/check` fields
-describe one incoming call's caller attribute, while a rule's `identifier_type` describes which
-attribute the rule's policy applies to.
+A rule is a generic policy for 1-3 identifier types on an `endpoint`, not a specific caller
+instance — there's no field to target one particular user/key/IP value. Only one **active** rule
+can exist per `(endpoint, identifier_signature)` scope — enforced by a partial unique index in
+Postgres (`ux_rules_active_scope`) and pre-checked in the service layer for a specific error
+message; a deactivated/deleted rule never blocks a new active one in the same scope. A single-type
+rule and a composite rule sharing a type can coexist on the same endpoint (their signatures
+differ), e.g. `{api_key}` and `{api_key, ip}`.
+
+`params` is validated by building the rule's algorithm config at write time (create/update) — a
+missing/malformed param for the chosen algorithm is rejected with `422 INVALID_RULE_PARAMS` at
+write time, rather than silently falling back to the static default the first time `/check` hits
+it.
+
+Note: a rule-definition `identifier_type`/`identifier_types` is unrelated to (but shares
+vocabulary with) the `/check` request's identifier fields — the `/check` fields describe one
+incoming call's caller attribute(s), while a rule's identifier types describe which attribute(s)
+the rule's policy applies to.
 
 ### Error envelope
 
@@ -395,8 +432,11 @@ All 4xx/5xx responses from the rules-CRUD endpoints use:
 | `RULE_NOT_FOUND`        | 404    | Unknown rule id |
 | `ALGORITHM_NOT_FOUND`   | 422    | Unknown `algorithm_id` on create/update |
 | `VERSION_CONFLICT`      | 409    | `expected_version` doesn't match the current row |
-| `SCOPE_CONFLICT`        | 409    | An active rule already exists for the same scope |
-| `VALIDATION_ERROR`      | 422    | Malformed request body (bad enum value, missing required field, etc.) |
+| `SCOPE_CONFLICT`        | 409    | An active rule already exists for the same `(endpoint, identifier_signature)` scope |
+| `INVALID_RULE_PARAMS`   | 422    | `params` don't fit the rule's algorithm (checked at write time) |
+| `INVALID_IDENTIFIER_TYPES` | 422 | `identifier_types` shape violation (count, duplicates, `global` combined with another type) |
+| `INVALID_IDENTIFIER_VALUE` | 422 | A `/check` identifier value fails its type's validator (never echoes the raw value) |
+| `VALIDATION_ERROR`      | 422    | Malformed request body (bad enum value, missing required field, etc.) — never echoes raw identifier values either |
 
 ### How rules reach `/check`
 
@@ -405,6 +445,20 @@ At startup the app loads **every** rule from Postgres into an in-process cache
 fully replaces the cache every `RULES_POLL_INTERVAL_SECONDS` (default `60`), so a rule created/
 edited/deleted via the CRUD API takes effect on `/check` within one poll interval — no restart.
 The request path only ever reads this in-memory cache, never Postgres.
+
+Resolution order for a given `/check` request (identifiers provided as a set of types `S`):
+
+1. Among active non-`global` rules at the endpoint whose identifier types are a subset of `S`,
+   the most specific wins (largest type set; ties broken by `priority` desc, then
+   `identifier_signature` asc). The Redis key is then built from *only* that rule's types
+   projected onto the request's values — e.g. a rule scoped to `{api_key}` matched by a request
+   also carrying `ip` still buckets by `api_key` alone.
+2. Else the active `global` rule for the endpoint, if any — keyed off every identifier the request
+   provided.
+3. Else the static YAML `default` — also keyed off every identifier the request provided.
+
+For a single-identifier request this collapses to the pre-Phase-5 chain: exact type match, then
+`global`, then the static default.
 
 For a given `/check` request, `RateLimiterService` picks the limiter in this order:
 

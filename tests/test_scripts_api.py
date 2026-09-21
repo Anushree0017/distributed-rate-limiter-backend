@@ -31,8 +31,7 @@ def test_reload_scripts_leaves_scripts_invocable(monkeypatch):
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
     settings.reload()
     payload = {
-        "identifier_value": "scripts-reload-client",
-        "identifier_type": "client_id",
+        "identifiers": [{"type": "client_id", "value": "scripts-reload-client"}],
         "endpoint": "/api/v1/orders",
     }
 
