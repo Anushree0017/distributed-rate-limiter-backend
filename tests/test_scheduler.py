@@ -3,12 +3,15 @@ scheduler-owned failure-handling wrapper around `load_rules_into_cache`.
 """
 from core.scheduler import _run_scheduled_rules_poll, _scheduler, shutdown_scheduler, start_scheduler
 from core.settings import settings
+from model.identifier import IdentifierType
 from services.rules_cache import RulesCache
 
 
 async def test_run_scheduled_rules_poll_failure_keeps_old_cache(monkeypatch):
     cache = RulesCache()
-    cache.load_all([{"id": "keep-me", "endpoint": "/x", "identifier_type": "global",
+    cache.load_all([{"id": "keep-me", "endpoint": "/x", "identifier_types": ["global"],
+                      "identifier_signature": "global", "is_global": True,
+                      "engine_identifier_types": frozenset({IdentifierType.ENDPOINT}),
                       "algorithm_id": "a", "algorithm_name": "FixedWindow",
                       "params": {}, "status": "active", "priority": 100, "version": 1}])
 

@@ -1,7 +1,8 @@
 import pytest
 from pydantic import ValidationError
 
-from model.identifier import ClientIdentifier, IdentifierType
+from model.identifier import IdentifierType
+from tests.conftest import make_client_identifier
 from model.rate_limiter_config import EndpointConfig
 from services.factory import RateLimiterFactory
 from services.rate_limiter.fixed_window import FixedWindowLimiter
@@ -56,7 +57,7 @@ def test_two_scopes_with_identical_config_get_isolated_keys(redis_client):
     limiter_b = RateLimiterFactory.create(config, redis_client, scope="/endpoint-b")
 
     assert limiter_a is not limiter_b
-    identifier = ClientIdentifier(value="same-client")
+    identifier = make_client_identifier("same-client")
     assert limiter_a._key(identifier) != limiter_b._key(identifier)
 
 

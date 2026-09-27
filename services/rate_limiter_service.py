@@ -1,17 +1,17 @@
 """Single entry point the API layer uses to enforce rate limits."""
 import logging
-from dataclasses import dataclass
 
 from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
+from core.key_hasher import KeyHasher
 from dto.rate_limit_check_request import RateLimitCheckRequestDTO
 from interfaces.base import RateLimiter
-from model.identifier import ClientIdentifier, IdentifierType
+from model.identifier import IdentifierType, build_client_identifier
+from model.identifier_validation import InvalidIdentifierValue, validate_and_normalize
 from model.rate_limit_result import RateLimitResult
 from model.rate_limiter_config import EndpointConfig, RateLimiterSettings
-from model.rule_identifier_type import RuleIdentifierType
 from services.factory import RateLimiterFactory
 from services.rule_algorithm_mapper import UnsupportedRuleAlgorithmError, build_algorithm_config
 from services.rules_cache import RulesCache
@@ -19,115 +19,99 @@ from services.rules_cache import RulesCache
 logger = logging.getLogger(__name__)
 
 _DEFAULT_SCOPE = "__default__"
-_GLOBAL_RULE_IDENTIFIER_TYPE = "global"
-
-# Bridges the rules-CRUD identifier-type vocabulary (`RuleIdentifierType`,
-# what an operator picks when creating a rule) to the runtime vocabulary
-# (`IdentifierType`, what actually gets baked into the Redis key via
-# `ClientIdentifier.key()`). Exhaustive over every current `RuleIdentifierType`
-# member — kept explicit rather than derived because the two enums are
-# allowed to evolve independently (see `model/rule_identifier_type.py`'s
-# module docstring) and a silent 1:1 assumption would break the moment they
-# diverge again. Two entries are non-trivial: `ip` -> `IP_ADDRESS` (different
-# spelling) and `global` -> `ENDPOINT` (a `global`-scoped rule has no real
-# caller attribute to key on, same rationale as the static fallback config).
-_RULE_TO_ENGINE_IDENTIFIER_TYPE: dict[str, IdentifierType] = {
-    RuleIdentifierType.GLOBAL.value: IdentifierType.ENDPOINT,
-    RuleIdentifierType.USER_ID.value: IdentifierType.USER_ID,
-    RuleIdentifierType.API_KEY.value: IdentifierType.API_KEY,
-    RuleIdentifierType.CLIENT_ID.value: IdentifierType.CLIENT_ID,
-    RuleIdentifierType.IP.value: IdentifierType.IP_ADDRESS,
-    RuleIdentifierType.TENANT_ID.value: IdentifierType.TENANT_ID,
-    RuleIdentifierType.SESSION_ID.value: IdentifierType.SESSION_ID,
-    RuleIdentifierType.DEVICE_ID.value: IdentifierType.DEVICE_ID,
-    RuleIdentifierType.ORGANIZATION_ID.value: IdentifierType.ORGANIZATION_ID,
-    RuleIdentifierType.ACCOUNT_ID.value: IdentifierType.ACCOUNT_ID,
-    RuleIdentifierType.REGION.value: IdentifierType.REGION,
-    RuleIdentifierType.USER_AGENT.value: IdentifierType.USER_AGENT,
-    RuleIdentifierType.REQUEST_SOURCE.value: IdentifierType.REQUEST_SOURCE,
-    RuleIdentifierType.SUBSCRIPTION_TIER.value: IdentifierType.SUBSCRIPTION_TIER,
-    RuleIdentifierType.WEBHOOK_ID.value: IdentifierType.WEBHOOK_ID,
-    RuleIdentifierType.IP_RANGE.value: IdentifierType.IP_RANGE,
-    RuleIdentifierType.ENDPOINT.value: IdentifierType.ENDPOINT,
-}
-
-
-@dataclass
-class _EndpointLimiter:
-    limiter: RateLimiter
-    identifier_type: IdentifierType
 
 
 class RateLimiterService:
     """Resolves the `RateLimiter` for each `/check` request. Operator-defined
     DB rules (via `rules_cache` — never the DB itself on the request path) are
-    the source of truth; the static YAML `default` is only the fallback when no
-    rule matches. See `_resolve_limiter` for the exact precedence and
-    `.claude/plans/phase3/plan-part2.md` for the design this implements.
+    the source of truth; the static YAML `default` is only the fallback when
+    no rule matches. See `_resolve_rule` for the exact precedence and
+    `.claude/plans/phase5/plan.md` for the composite-identifier design this
+    implements.
     """
 
     def __init__(
         self,
         settings: RateLimiterSettings,
         redis_client: Redis,
+        hasher: KeyHasher,
         rules_cache: RulesCache | None = None,
     ) -> None:
         self._redis_client = redis_client
         self._rules_cache = rules_cache
-        self._default = _EndpointLimiter(
-            limiter=RateLimiterFactory.create(settings.default, redis_client, scope=_DEFAULT_SCOPE),
-            identifier_type=settings.default.identifier_type,
-        )
+        self._hasher = hasher
+        self._default_limiter = RateLimiterFactory.create(settings.default, redis_client, scope=_DEFAULT_SCOPE)
+        # "Missing component" warnings (a more specific rule existed but the
+        # request lacked one of its types) are logged once per
+        # (rule_id, missing_types) *per cache generation* — reset whenever
+        # RulesCache.load_all runs again, so a persistent misconfiguration
+        # keeps surfacing after every poll instead of going silent forever
+        # after the first cycle.
+        self._warned_missing_component: set[tuple[str, frozenset]] = set()
+        self._warned_generation = -1
 
-    def _resolve_limiter(
-        self, endpoint: str, identifier_type: str, fallback: RateLimiter
-    ) -> tuple[RateLimiter, IdentifierType]:
-        """Precedence: an active DB rule for exactly `(endpoint,
-        identifier_type)` wins, then an active `global`-scoped rule for this
-        endpoint, then the static YAML `default`. `identifier_type` comes
-        straight from the `/check` request now — the gateway states which
-        attribute it's sending, so lookup is a direct cache hit rather than
-        matching a raw value; there is no priority/id tie-break needed since
-        `ux_rules_active_scope` guarantees at most one active rule per
-        `(endpoint, identifier_type)`. `rules_cache` is guaranteed ready
-        before the app serves any traffic (main.py's lifespan calls
-        `load_all` before `yield`), so there's no "cache not ready" case to
-        handle here.
+    def _reset_missing_component_warnings_if_new_generation(self) -> None:
+        if self._rules_cache is None:
+            return
+        generation = self._rules_cache.get_generation()
+        if generation != self._warned_generation:
+            self._warned_missing_component.clear()
+            self._warned_generation = generation
 
-        Returns the limiter to check against *and* the `IdentifierType` to
-        key it with — the caller must use the returned type, not assume one,
-        since it comes from whichever rule (if any) actually won: mapped via
-        `_RULE_TO_ENGINE_IDENTIFIER_TYPE` for a matched rule, or
-        `self._default.identifier_type` for every fallback case.
+    def _resolve_rule(self, endpoint: str, provided_types: frozenset) -> dict | None:
+        """Resolution order (`.claude/plans/phase5/plan.md`):
+        1. Among active non-global rules at `endpoint` whose
+           `engine_identifier_types` is a subset of `provided_types`, the
+           most specific (candidates are pre-sorted by
+           `(-len(types), -priority, signature)`, so the first subset match
+           wins — see `RulesCache.load_all`).
+        2. Else the active `global` rule for `endpoint`.
+        3. Else `None` (caller falls back to the static YAML default).
 
-        A rule that exists but can't be turned into a runtime algorithm
-        (unknown algorithm name, or params missing what that algorithm
-        needs — `rules.params` isn't schema-validated against
-        `algorithms.params` yet) or whose `identifier_type` has no runtime
-        mapping (stale data from a since-removed `RuleIdentifierType` member;
-        every current member has a mapping) is treated as "no rule": log and
-        fall back, never fail the request over a malformed rule.
+        Note: `RuleIdentifierType.GLOBAL` and `RuleIdentifierType.ENDPOINT`
+        both bridge to the same engine `IdentifierType.ENDPOINT`
+        (`model/rule_identifier_type.py`'s `RULE_TO_ENGINE_IDENTIFIER_TYPE`),
+        so a request explicitly providing `{type: "endpoint", value: ...}`
+        can subset-match an `endpoint`-typed rule here — that's intended now
+        that every caller sends real identifiers (no more implicit
+        `identifier_type="global"` request shorthand — see
+        `.claude/plans/phase5/plan.md`'s "Removed: legacy single-identifier
+        request form" for the history of why this used to need a
+        `skip_candidates` workaround here).
         """
         if self._rules_cache is None:
-            return fallback, self._default.identifier_type
+            return None
 
-        rule = self._rules_cache.get_by_lookup_key(endpoint, identifier_type)
-        if rule is None and identifier_type != _GLOBAL_RULE_IDENTIFIER_TYPE:
-            rule = self._rules_cache.get_by_lookup_key(endpoint, _GLOBAL_RULE_IDENTIFIER_TYPE)
-        if rule is None:
-            return fallback, self._default.identifier_type
+        self._reset_missing_component_warnings_if_new_generation()
 
-        identifier_type = _RULE_TO_ENGINE_IDENTIFIER_TYPE.get(rule["identifier_type"])
-        if identifier_type is None:
-            logger.warning(
-                "Rule %s for endpoint=%s has an identifier_type with no runtime mapping "
-                "(identifier_type=%s); falling back to static config",
-                rule["id"],
-                endpoint,
-                rule["identifier_type"],
-            )
-            return fallback, self._default.identifier_type
+        for rule in self._rules_cache.get_candidates(endpoint):
+            engine_types = rule["engine_identifier_types"]
+            if engine_types <= provided_types:
+                return rule
+            missing = engine_types - provided_types
+            warn_key = (rule["id"], missing)
+            if warn_key not in self._warned_missing_component:
+                self._warned_missing_component.add(warn_key)
+                logger.warning(
+                    "endpoint=%s: rule %s (identifier_signature=%s) was skipped — the request is "
+                    "missing identifier type(s) %s",
+                    endpoint,
+                    rule["id"],
+                    rule["identifier_signature"],
+                    sorted(t.value for t in missing),
+                )
 
+        return self._rules_cache.get_global(endpoint)
+
+    def _build_limiter_for_rule(self, rule: dict) -> RateLimiter | None:
+        """`None` means "this rule can't be turned into a runtime algorithm
+        right now" (unknown algorithm name, or params missing what that
+        algorithm needs — `rules.params` isn't schema-validated against
+        `algorithms.params` at the DB layer) — the caller falls back to the
+        static default rather than failing the request over a malformed
+        rule. Redis scope is `rule:{rule_id}` so state is stable across polls
+        and isolated from the YAML default's scope.
+        """
         try:
             params = build_algorithm_config(rule["algorithm_name"], rule["params"])
         except (UnsupportedRuleAlgorithmError, KeyError, TypeError, ValueError):
@@ -135,24 +119,29 @@ class RateLimiterService:
                 "Rule %s for endpoint=%s has unusable algorithm/params (algorithm=%s, params=%s); "
                 "falling back to static config",
                 rule["id"],
-                endpoint,
+                rule["endpoint"],
                 rule["algorithm_name"],
                 rule["params"],
                 exc_info=True,
             )
-            return fallback, self._default.identifier_type
-
-        config = EndpointConfig(identifier_type=identifier_type, config=params)
-        limiter = RateLimiterFactory.create(config, self._redis_client, scope=f"rule:{rule['id']}")
-        return limiter, identifier_type
+            return None
+        # `EndpointConfig.identifier_type` only carries real meaning for the
+        # static YAML default; a rule-derived limiter's actual identifier
+        # types live in `rule["identifier_types"]` and are handled entirely
+        # by the caller (key projection), so ENDPOINT here is a harmless
+        # placeholder never read back out.
+        config = EndpointConfig(identifier_type=IdentifierType.ENDPOINT, config=params)
+        return RateLimiterFactory.create(config, self._redis_client, scope=f"rule:{rule['id']}")
 
     async def check_rate_limit(self, payload: RateLimitCheckRequestDTO) -> RateLimitResult:
-        """Resolve the limiter for `(endpoint, identifier_type)` — a matching
-        DB rule if one exists, otherwise the static YAML `default` fallback —
-        and check `identifier_value` against it. The gateway now states
-        `identifier_type` explicitly (used for rule lookup); `identifier_value`
-        is the raw value that gets baked into the Redis key via
-        `ClientIdentifier`, same role it always played.
+        """Validate every provided identifier, resolve the limiter to check
+        against (a matching DB rule, or the static YAML default), then check.
+
+        **Key contents follow the matched rule, not the request**: a rule
+        scoped to `{api_key}` matched by a request also carrying `ip` buckets
+        by `api_key` alone (the request's values are projected onto the
+        rule's own types); a `global` rule or the static default uses every
+        provided identifier.
 
         Redis failure policy (decided once, here — redis_guidelines.md §7):
         - `ConnectionError` / `TimeoutError` (Redis unreachable or a hung
@@ -161,19 +150,41 @@ class RateLimiterService:
           traffic because this advisory service couldn't render a decision.
         - Anything else (notably `ResponseError` from a Lua runtime error —
           wrong `KEYS` count, a bug in a script) is *not* a transient outage.
-          It indicates a real bug or a key/config mismatch, so it propagates
-          to the API layer's generic exception handler (500), rather than
-          silently failing open and masking the problem.
+          It propagates to the API layer's generic exception handler (500).
         """
-        endpoint, identifier_value, identifier_type = (
-            payload.endpoint,
-            payload.identifier_value,
-            payload.identifier_type,
-        )
-        limiter, resolved_identifier_type = self._resolve_limiter(
-            endpoint, identifier_type, self._default.limiter
-        )
-        client_identifier = ClientIdentifier(type=resolved_identifier_type, value=identifier_value)
+        endpoint = payload.endpoint
+        raw_pairs = payload.as_pairs()
+
+        validated_pairs: list[tuple[IdentifierType, str]] = []
+        for index, (identifier_type, raw_value) in enumerate(raw_pairs):
+            try:
+                normalized_value = validate_and_normalize(identifier_type, raw_value)
+            except InvalidIdentifierValue as exc:
+                raise InvalidIdentifierValue(exc.identifier_type, exc.reason, index=index) from exc
+            validated_pairs.append((identifier_type, normalized_value))
+
+        provided_types = frozenset(identifier_type for identifier_type, _ in validated_pairs)
+        matched_rule = self._resolve_rule(endpoint, provided_types)
+
+        limiter: RateLimiter | None = None
+        if matched_rule is not None:
+            limiter = self._build_limiter_for_rule(matched_rule)
+
+        if limiter is not None and not matched_rule["is_global"]:
+            projected_pairs = [
+                (identifier_type, value)
+                for identifier_type, value in validated_pairs
+                if identifier_type in matched_rule["engine_identifier_types"]
+            ]
+        else:
+            # Global rule, or no usable rule matched (static default) — key
+            # off every identifier the request actually provided.
+            projected_pairs = validated_pairs
+
+        if limiter is None:
+            limiter = self._default_limiter
+
+        client_identifier = build_client_identifier(projected_pairs, self._hasher)
         algorithm = type(limiter).__name__
 
         try:

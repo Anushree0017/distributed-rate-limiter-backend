@@ -37,7 +37,7 @@ class RuleRepository:
     async def find_active_conflict(
         self,
         endpoint: str,
-        identifier_type: str,
+        identifier_signature: str,
         exclude_id: uuid.UUID | None = None,
     ) -> Rule | None:
         """The service-layer pre-check backstopped by `ux_rules_active_scope`
@@ -46,7 +46,7 @@ class RuleRepository:
         """
         stmt = select(Rule).where(
             Rule.endpoint == endpoint,
-            Rule.identifier_type == identifier_type,
+            Rule.identifier_signature == identifier_signature,
             Rule.status == RuleStatus.ACTIVE.value,
         )
         if exclude_id is not None:
@@ -67,6 +67,24 @@ class RuleRepository:
         await self._session.delete(rule)
         await self._session.commit()
 
+    async def list_by_group(self, group_id: uuid.UUID) -> list[Rule]:
+        result = await self._session.execute(
+            select(Rule).where(Rule.group_id == group_id).options(selectinload(Rule.algorithm))
+        )
+        return list(result.scalars().all())
+
+    def add(self, rule: Rule) -> None:
+        """Non-committing add — used by `RuleGroupService`, which owns the
+        transaction boundary for multi-row group operations (see its
+        docstring). Plain single-rule CRUD (`create`) commits immediately;
+        this is for the group-transaction path only.
+        """
+        self._session.add(rule)
+
+    async def remove(self, rule: Rule) -> None:
+        """Non-committing delete — group-transaction counterpart to `delete`."""
+        await self._session.delete(rule)
+
     async def list_all(self) -> list[Rule]:
         """Every row, unpaginated, algorithm eager-loaded — used by
         `services/rules_loader.py` to populate `RulesCache` at startup and on
@@ -86,8 +104,13 @@ class RuleRepository:
             stmt = stmt.where(Rule.endpoint == filters.endpoint)
             count_stmt = count_stmt.where(Rule.endpoint == filters.endpoint)
         if filters.identifier_type is not None:
-            stmt = stmt.where(Rule.identifier_type == filters.identifier_type.value)
-            count_stmt = count_stmt.where(Rule.identifier_type == filters.identifier_type.value)
+            # Legacy single-type filter: a single-type rule's signature is
+            # just that type's value, so this stays an equality match.
+            stmt = stmt.where(Rule.identifier_signature == filters.identifier_type.value)
+            count_stmt = count_stmt.where(Rule.identifier_signature == filters.identifier_type.value)
+        if filters.identifier_signature is not None:
+            stmt = stmt.where(Rule.identifier_signature == filters.identifier_signature)
+            count_stmt = count_stmt.where(Rule.identifier_signature == filters.identifier_signature)
         if filters.status is not None:
             stmt = stmt.where(Rule.status == filters.status.value)
             count_stmt = count_stmt.where(Rule.status == filters.status.value)

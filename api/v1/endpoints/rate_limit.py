@@ -1,11 +1,11 @@
 """Rate limit check endpoint.
 
 This service runs independently of the API gateway: the gateway calls
-`POST /check` with an `identifier_type` (which attribute it's sending) and
-`identifier_value` (that attribute's raw value) *before* forwarding the real
-request, and enforces the result itself. This service never sees the
-gateway's actual traffic, so the check is a plain JSON payload rather than
-something derived from the incoming request/headers.
+`POST /check` with `endpoint` and `identifiers` (1-3 `{type, value}` pairs
+identifying the caller) *before* forwarding the real request, and enforces
+the result itself. This service never sees the gateway's actual traffic, so
+the check is a plain JSON payload rather than something derived from the
+incoming request/headers.
 """
 from fastapi import APIRouter, Depends
 

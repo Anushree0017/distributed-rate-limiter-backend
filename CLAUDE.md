@@ -14,8 +14,46 @@ Phase 1 (core rate limiter), Improvisation 1 (multi-identifier, strict config va
 eviction, standardized response fields), Improvisation 2 (non-positive config value validation,
 `/health`, a global exception handler, and app-wide logging), **Phase 2 (Redis + Lua
 integration)**, **Phase 3 (rules CRUD service)**, **Phase 3 Part 2 (rules cache + polling,
-wired into `/check`)**, and a clean-code pass removing `rules.identifier_value` (see "Deviations
-from the identifier_value-removal change" below) are all **fully implemented**. Rate-limit state
+wired into `/check`)**, a clean-code pass removing `rules.identifier_value` (see "Deviations
+from the identifier_value-removal change" below), **Phase 5 Part 1 (composite
+identifiers)**, and **Phase 5 Part 2 (endpoint groups)** are all **fully implemented**.
+
+**Phase 5 Part 2** adds `POST/GET/PATCH/DELETE /api/v1/groups` + `POST /api/v1/groups/{id}/members`
+(pure addition) + `PATCH /api/v1/rules/{id}/detach` + `POST /api/v1/rules/{id}/move-to-group`. A
+group (`rule_groups` table) is one policy template — algorithm, identifier types, base `params` —
+applied to many endpoints. Each member is still a plain `rules` row (`rules.group_id`,
+`rules.overrides`) with its own UUID and Redis scope, so the rules-cache/poller/`/check` path
+(Part 1) needed **zero** changes — it has no idea groups exist; it just sees more flat rules. The
+invariant `member.params == {**group.params, **member.overrides}` (plus matching
+`algorithm`/`identifier_types`/`priority`) is enforced entirely in `services/group_params.py` +
+`services/rule_group_service.py`, never at read time. `algorithm_id`/`identifier_types` are
+immutable after group creation; `move-to-group` is the one path that can change a grouped rule's
+algorithm/types, since it's re-parenting under a different group, not editing them directly. There
+is deliberately no "replace the full member set" endpoint — adding, removing, and updating a
+member's overrides are each a separate, narrower call (`POST .../members`, `DELETE /rules/{id}`,
+`PATCH /rules/{id}` with `overrides`) rather than one bulk-diff endpoint; see "Deviations from the
+Phase 5 Part 2 (groups) plan" below for why that shape was chosen over the plan's original
+dry-run-diff `PUT .../members`, and for the exact API/behavior decisions made while implementing
+it — several fields (`created_by`/`updated_by` on the group endpoints) aren't in the plan's
+illustrative request bodies but were required to satisfy `rules.created_by`'s NOT NULL constraint.
+
+**Phase 5 Part 1** lets a rule be scoped to 1-3 identifier types at once instead of exactly
+one (`rules.identifier_types TEXT[]` + `rules.identifier_signature`, the new uniqueness key
+alongside `endpoint`). `/check` accepts a composite `identifiers: [{type, value}, ...]` list (1-3
+entries) — the original single `identifier_type`/`identifier_value` request pair (and the matching
+`identifier_type` field on `POST /rules`) **was later removed entirely**, once verified end-to-end
+via the local simulator (see "Deviations... — Removed: legacy single-identifier request form"
+below). **The real API gateway (`infra/terraform/lambda/handler.py`) and `load-test/` still send
+the old shape and must be migrated before the next redeploy** — see
+`.claude/plans/phase5/plan.md`'s "TODO before the next deployment" section at the top of that
+file. Resolution now picks the most specific active rule
+whose identifier types are a subset of what the request provided (falling back to a less specific
+rule, then the endpoint's `global` rule, then the static default) instead of requiring an exact
+type match. Every identifier value is validated per type (`model/identifier_validation.py`) and
+HMAC-hashed (`core/key_hasher.py`, keyed by the required `IDENTIFIER_HASH_SECRET` env var) into
+the Redis key — `rl:{algorithm}:{scope}:{key_signature}:{digest}` — so raw values never reach
+Redis, logs, or error bodies. See "Deviations from the Phase 5 Part 1 plan" below for the exact
+design decisions made while implementing it. Rate-limit state
 still lives in Redis for the `/check` decision path — every algorithm's check-and-increment runs
 as a single atomic Lua script — rather than in an in-process cache, so this service can run as
 multiple instances/workers against one Redis without their counters diverging. Phase 3 added a
@@ -163,9 +201,20 @@ alembic/                               0001 create algorithms -> 0002 seed algor
                                         from `rules` and rebuild `ux_rules_active_scope` as
                                         `UNIQUE (endpoint, identifier_type) WHERE status='active'`
                                         (data-destructive; see "Deviations from the
-                                        identifier_value-removal change"). `env.py` pulls the URL
-                                        from core.settings.get_database_url() and imports every
-                                        model for autogenerate
+                                        identifier_value-removal change") -> 0007 expand `rules` for
+                                        composite identifiers (`identifier_types`/
+                                        `identifier_signature`, rebuilds `ux_rules_active_scope` on
+                                        `(endpoint, identifier_signature)`) -> 0008 drop the now-
+                                        unused `identifier_type` column -> 0009 seed 5 composite
+                                        sample rules (most-specific-wins/fallback demo data,
+                                        `created_by='seed_migration'`) -> 0010 create `rule_groups`
+                                        + `rules.group_id`/`overrides` (Phase 5 Part 2) -> 0011 seed
+                                        2 sample rule groups with 5 members total (1 override each
+                                        group, `created_by='seed_migration'`; downgrade deletes
+                                        members before groups, since `rules.group_id` is `ON DELETE
+                                        RESTRICT`). `env.py` pulls the URL from
+                                        core.settings.get_database_url() and imports every model for
+                                        autogenerate
 
 --- Phase 3 Part 2 (rules cache + polling into /check) ---
 services/rules_cache.py                RulesCache — storage-agnostic in-memory hold of all rules,
@@ -226,7 +275,330 @@ services/rate_limiter_service.py       `_resolve_limiter()` precedence: DB rule 
 core/settings.get_rules_poll_interval_seconds()  Reads RULES_POLL_INTERVAL_SECONDS (default 900,
                                         i.e. 15 minutes)
 core/dependencies.get_rules_cache()    Pulls app.state.rules_cache (for a future debug endpoint)
+
+--- Phase 5 Part 1 (composite identifiers) ---
+model/identifier_validation.py         Per-`IdentifierType` value validator/normalizer registry
+                                        (`validate_and_normalize`), exhaustive over every member
+                                        (enforced by a unit test). Length checked before any
+                                        regex; IPs canonicalized via `ipaddress`. Raises
+                                        `InvalidIdentifierValue` (type + reason + optional index,
+                                        never the raw value) -> mapped to 422 in core/exceptions.py
+core/key_hasher.py                     `KeyHasher(secret).digest(pairs)` — sorts `(type, value)`
+                                        pairs, JSON-encodes (never delimiter-joins, to avoid
+                                        component-boundary collisions), HMAC-SHA256s, truncates to
+                                        32 hex chars. One instance built in main.py's lifespan from
+                                        `IDENTIFIER_HASH_SECRET`, passed into `RateLimiterService`
+core/settings.get_identifier_hash_secret()  Required, >=32 chars, hard-fails Settings()
+                                        construction if missing/short (same stance as Redis/
+                                        Postgres) — see `_read_identifier_hash_secret`
+model/rule_identifier_type.py          Gained `MAX_IDENTIFIERS_PER_RULE = 3`,
+                                        `RULE_TO_ENGINE_IDENTIFIER_TYPE` (moved here from
+                                        rate_limiter_service.py — both rules_loader.py and
+                                        rate_limiter_service.py need it now), and
+                                        `normalize_identifier_types()` — the one shared
+                                        helper (dedupe, validate members, enforce 1-3 count and
+                                        `global`-alone, sort) that both `RuleService` and (Part 2)
+                                        `RuleGroupService` must call; nothing else derives
+                                        `identifier_signature`
+model/identifier.py                    `ClientIdentifier` is now `{key_signature, digest}` (not
+                                        `{type, value}`) — `.key()` returns
+                                        `"{key_signature}:{digest}"` unchanged in shape, so
+                                        algorithm classes (`rl:{algo}:{scope}:` + `.key()`) didn't
+                                        change at all. `build_client_identifier(pairs, hasher)` is
+                                        the only place a `ClientIdentifier` is actually constructed
+                                        from raw values — algorithm classes never see raw pairs or
+                                        learn hashing exists
+model/rule.py                          `identifier_type` column replaced by `identifier_types
+                                        TEXT[]` + `identifier_signature TEXT`
+services/rules_cache.py                Two endpoint-keyed indexes instead of one: `_candidates_by_
+                                        endpoint` (active, non-global, usable rules, pre-sorted by
+                                        `(-len(engine_identifier_types), -priority,
+                                        identifier_signature)` — first subset match wins) and
+                                        `_global_by_endpoint`. `get_generation()` increments every
+                                        `load_all`, used by `RateLimiterService` to reset its
+                                        "already warned about this missing component" set once per
+                                        poll cycle rather than once per process lifetime
+services/rules_loader.py               `_serialize_rule` now also bridges `identifier_types` to
+                                        `engine_identifier_types: frozenset[IdentifierType] | None`
+                                        (`None` = no runtime mapping for one of its types — treated
+                                        as unusable, excluded from both `RulesCache` indexes, same
+                                        "log and exclude" stance as an unusable algorithm/params)
+                                        and adds `is_global` (`identifier_signature == "global"`)
+services/rate_limiter_service.py       `_resolve_rule(endpoint, provided_types)` replaces
+                                        `_resolve_limiter`: subset-match against
+                                        `get_candidates()`, else `get_global()`, else `None` (->
+                                        static default). (Briefly needed a `skip_candidates` escape
+                                        hatch for the legacy `identifier_type="global"` request
+                                        form's collision with `endpoint`-typed rules — removed
+                                        along with that form; see the deviation below, "Removed:
+                                        legacy single-identifier request form.") Key projection: a
+                                        matched non-global rule buckets by only its own types
+                                        (projected from the request's validated pairs); a global
+                                        match or static fallback buckets by every provided
+                                        identifier
+dto/rate_limit_check_request.py        `RateLimitCheckRequestDTO.identifiers: list[IdentifierValueDTO]`
+                                        (1-3 entries, required) is the only request shape now — the
+                                        original single `identifier_type`/`identifier_value` pair
+                                        was removed (see deviation below). `.as_pairs()` normalizes
+                                        into `list[tuple[IdentifierType, str]]` for the service layer
+dto/rule_dto.py                        `RuleCreateRequestDTO.identifier_types: list[RuleIdentifierType]`
+                                        (required) is the only creation shape now — the legacy
+                                        singular `identifier_type` field was removed (see deviation
+                                        below). `RuleResponseDTO` returns `identifier_types`/
+                                        `identifier_signature` instead of `identifier_type`.
+                                        `RuleFilter` still has a legacy `identifier_type` *query*
+                                        filter (matched against `identifier_signature` equality) —
+                                        that one wasn't removed, it's a read-side convenience, not
+                                        part of the request-body contract that got cleaned up
+services/rule_service.py               `create_rule`/`update_rule` now call
+                                        `build_algorithm_config` against the rule's (candidate)
+                                        params at write time and raise `InvalidRuleParamsError`
+                                        (422) on mismatch — closes the "rules.params isn't
+                                        schema-validated against algorithms.params" gap called out
+                                        in earlier phases' "explicitly out of scope" notes, for the
+                                        write path only (the request-time fallback-on-unusable-rule
+                                        behavior in rate_limiter_service.py is unchanged, since a
+                                        pre-existing row could in principle still be unusable e.g.
+                                        after an algorithm's param schema itself changed)
+core/exceptions.py                     New: `InvalidRuleParamsError`, and handlers for
+                                        `InvalidIdentifierTypesError` (422) and
+                                        `InvalidIdentifierValue` (422, echoes type+reason+index,
+                                        never the value). `ScopeConflictError`'s field renamed
+                                        `identifier_type` -> `identifier_signature`. The generic
+                                        `RequestValidationError` handler now strips `input` from
+                                        each error entry — FastAPI's default shape otherwise echoes
+                                        the whole raw request body (identifier values included) for
+                                        a `model_validator` failure like "both request forms given"
+                                        or "duplicate identifier types" in `identifiers`; this was
+                                        a real invariant violation caught by the simulator's
+                                        `run_identifier_validation_rejection_scenarios`, not a
+                                        theoretical one
+
+--- Phase 5 Part 2 (endpoint groups) ---
+model/rule_group.py                    `RuleGroup` ORM model — `rule_groups` table. Mirrors
+                                        `model/rule.py`'s conventions (algorithm FK, `identifier_
+                                        types`/`identifier_signature`, `priority`, timestamps).
+                                        `name` uniqueness is case-insensitive, enforced by a
+                                        functional index (`ux_rule_groups_name_ci` on
+                                        `lower(name)`), not a plain column UNIQUE constraint
+model/rule.py                          Gained `group_id UUID NULL` (FK `rule_groups.id`, `ON DELETE
+                                        RESTRICT`) and `overrides JSONB NULL`
+                                        (`JSONB(none_as_null=True)` — see the deviation below on
+                                        why that flag is required). CHECK `overrides IS NULL OR
+                                        group_id IS NOT NULL`; index on `group_id`
+services/group_params.py               `compute_effective_params(base, overrides)` (the one shallow
+                                        merge) and `validate_overrides_or_raise(algorithm_name,
+                                        base_params, overrides)` (checks override keys exist in
+                                        base params, then that the merge builds via
+                                        `build_algorithm_config`) — shared by `RuleGroupService`
+                                        (group/member writes) and `RuleService` (a grouped rule's
+                                        `PATCH overrides`), so the invariant is validated in exactly
+                                        one place regardless of which endpoint triggers the write
+repositories/rule_group_repository.py  Dumb data access for `rule_groups`, non-committing
+                                        throughout (`add`, `get_by_id(for_update=...)`,
+                                        `get_by_name_ci`, `list` with a member-count subquery,
+                                        `delete`) plus explicit `flush`/`commit`/`rollback`/
+                                        `refresh` passthroughs — `RuleGroupService` owns the
+                                        transaction boundary (see the deviation below)
+repositories/rule_repository.py        Gained `list_by_group(group_id)`, and two non-committing
+                                        methods (`add`, `remove`) used only by the group-transaction
+                                        path — `create`/`update`/`delete` (single-rule CRUD) are
+                                        unchanged and still commit per call
+repositories/algorithm_repository.py   Gained `get_by_name(name)` — `PATCH /rules/{id}/detach`'s
+                                        caller picks an algorithm by name, not id
+services/rule_group_service.py         All business rules for groups: `create_group` (optional
+                                        initial members, all-or-nothing conflict check),
+                                        `update_group` (locks the group row, recomputes every
+                                        member's params in the same transaction), `add_members`
+                                        (pure addition — never touches or removes an existing
+                                        member; all-or-nothing conflict check, same shape as
+                                        `create_group`'s initial-members path), `delete_group`
+                                        (`detach` or `delete` member-handling modes), `detach_rule`
+                                        (takes the caller-chosen `algorithm`/`params`, validated via
+                                        `build_algorithm_config` before anything is mutated),
+                                        `move_to_group` (join or re-parent; replaces the rule's
+                                        algorithm/identifier_types/priority with the target group's;
+                                        conflict-checked only when the identifier signature actually
+                                        changes). Removing a member or changing its overrides isn't
+                                        here at all — `DELETE /rules/{id}` and `PATCH /rules/{id}
+                                        {overrides}` (both on the plain rules API) already cover
+                                        those, so there's no `remove_member`/`update_member` method
+services/rule_service.py               `update_rule` gained the grouped-rule guards: `algorithm_id`/
+                                        `params`/`priority` rejected on a grouped rule
+                                        (`RuleManagedByGroupError`, 409); `overrides` rejected on a
+                                        standalone rule (`OverridesRequireGroupError`, 422);
+                                        `overrides` on a grouped rule recomputed/validated via
+                                        `services/group_params.py` against the rule's group (fetched
+                                        through a new `RuleGroupRepository` constructor dependency)
+dto/rule_group_dto.py                  Request/response DTOs for `/groups`. `AddMembersRequestDTO`
+                                        (`POST .../members`) has no actor field — new member rules
+                                        take the group's own `created_by`. `DetachRuleRequestDTO`
+                                        (`{algorithm: str, params: dict}`, both required) is looked
+                                        up by algorithm *name*, not id, since the caller is picking
+                                        a replacement from scratch, not referencing an existing
+                                        rule's `algorithm_id`. `RuleGroupCreateRequestDTO`/
+                                        `RuleGroupUpdateRequestDTO` use `extra="forbid"` so
+                                        `algorithm_id`/`identifier_types` on a PATCH 422s instead of
+                                        being silently ignored
+dto/rule_dto.py                        `RuleCreateRequestDTO` gained `extra="forbid"` (blocks
+                                        `group_id`/`overrides` on `POST /rules`).
+                                        `RuleUpdateRequestDTO` gained `overrides: dict | None`.
+                                        `RuleResponseDTO` gained `group_id`/`overrides`
+api/v1/endpoints/groups.py             All `/groups*` endpoints. `POST /groups/{id}/members`
+                                        returns its `{created, conflicts}` body directly (not the
+                                        standard `{"error": ...}` envelope) with status `201`
+                                        (`conflicts` empty) or `409` (any conflict — `created` is
+                                        then always empty) — built as a plain `JSONResponse` in the
+                                        controller rather than through the exception-handler
+                                        mechanism, since the same body shape is the success body
+                                        too, not just an error body
+api/v1/endpoints/rules.py              Gained `PATCH /rules/{id}/detach` (not `POST` — this modifies
+                                        an existing rule, matching `PATCH /rules/{id}`'s verb) and
+                                        `POST /rules/{id}/move-to-group`, both delegating to
+                                        `RuleGroupService` (not `RuleService`) since they need
+                                        group-repository access
+core/exceptions.py                     New: `RuleGroupNotFoundError` (404), `GroupNameConflictError`
+                                        (409), `RuleManagedByGroupError` (409),
+                                        `OverridesRequireGroupError` (422), `RuleNotInGroupError`
+                                        (409), `InvalidOverrideKeysError` (422),
+                                        `DuplicateMemberEndpointError` (422),
+                                        `GroupMemberConflictError` (409, carries a conflict list),
+                                        `AlgorithmNameNotFoundError` (422, the name-based lookup
+                                        `PATCH /rules/{id}/detach` uses),
+                                        `MembersWriteRaceError` (409 backstop for a racing
+                                        unique-constraint violation slipping past the diff-based
+                                        pre-check)
 ```
+
+### Deviations from the Phase 5 Part 1 (composite identifiers) plan worth knowing about
+- **Removed: legacy single-identifier request form.** After Phase 5 Part 1 landed and was verified
+  end-to-end (unit tests + the local simulator), the pre-Phase-5 `identifier_type`/
+  `identifier_value` pair on `POST /check` and the singular `identifier_type` field on
+  `POST /rules` were removed entirely — not kept as a deprecated-but-working alias. This was an
+  explicit, requested cleanup, not an oversight: the composite form (`identifiers`/
+  `identifier_types`) fully subsumes the legacy one, and keeping both meant permanently carrying
+  the `_exactly_one_form`/`_exactly_one_identifier_form` validators, the `RULE_TO_ENGINE_
+  IDENTIFIER_TYPE` bridging inside `RateLimitCheckRequestDTO.as_pairs()`, and the `skip_candidates`
+  resolution workaround below — none of which have any reason to exist once every caller sends
+  composite. **This is a breaking wire-format change**: `infra/terraform/lambda/handler.py` (the
+  real API gateway) and `load-test/` still send the old shape and were deliberately *not* migrated
+  as part of this change (out of scope for a backend-only pass) — see
+  `.claude/plans/phase5/plan.md`'s "TODO before the next deployment" section for what has to happen
+  before the next redeploy, or every `/check` call from the live gateway will 422. Only
+  `simulators/simulate_rate_limiter.py` (local-only) was migrated, and only at the level of
+  `gateway_forward()`'s internal payload construction — its own `identifier_type`/
+  `identifier_value` parameters stayed as that function's convenience API, now translated
+  internally into a one-entry `identifiers` list.
+- **A real resolution bug found (and fixed), then made moot by the removal above:**
+  `RuleIdentifierType.GLOBAL` and `RuleIdentifierType.ENDPOINT` both bridge to the same engine
+  `IdentifierType.ENDPOINT` (`RULE_TO_ENGINE_IDENTIFIER_TYPE` — a pre-Phase-5 design choice, not
+  new). Pre-Phase-5, this never mattered because resolution matched on the literal
+  `identifier_type` string ("global" != "endpoint"). Once resolution moved to subset-matching on
+  *engine* types, a legacy `identifier_type="global"` request (`provided_types == {ENDPOINT}`)
+  became indistinguishable from a client explicitly presenting an `endpoint`-typed identifier, and
+  could incorrectly subset-match an unrelated `endpoint`-typed rule instead of falling through to
+  the actual `global` rule (caught by the simulator's `run_multi_identifier_type_scenario`, which
+  exercises both `/api/v1/reports`'s `global` rule (limit=20) and its `endpoint`-typed
+  `reports-v2` rule (limit=25) against the same engine type). Originally fixed via a
+  `_resolve_rule(..., skip_candidates=True)` escape hatch for that one legacy request shape; once
+  the legacy form was removed (there's no more implicit `identifier_type="global"` shorthand —
+  every caller sends real identifiers), `skip_candidates` had nothing left to guard and was deleted
+  along with it. The simulator's own `_GLOBAL_FALLTHROUGH_PROBE_TYPE` (`"webhook_id"`, a type no
+  seeded rule in `simulators/simulate_rate_limiter.py`'s scenarios scopes a single-type rule to) is
+  what replaces the old shorthand there: sending it alone as the sole identifier can never
+  subset-match a more specific rule, so the request always falls through to `global`/default, same
+  end behavior as the removed shorthand, achieved by sending a real (if synthetic) identifier
+  instead of a special-cased type string.
+- **`rules.priority` was already `INT NOT NULL DEFAULT 100` from Phase 3** — the plan's Step 1
+  called for adding `priority INT NOT NULL DEFAULT 0` fresh. Reused the existing column as-is
+  rather than re-adding it; the "higher wins" tie-break semantics from the plan apply to it
+  unchanged (Phase 3 seeded lower numbers for more specific single-type rules, which happened to
+  never need a same-specificity tie-break before composite rules existed — see the ambiguous-tie
+  WARNING logging in `RulesCache._log_ambiguous_ties` for how a real tie now surfaces).
+- **`api_key` validation bounds (`API_KEY_MIN_LENGTH = 8`, `API_KEY_MAX_LENGTH = 128`)** were
+  chosen by checking every `api_key`-typed value already used in
+  `simulators/simulate_rate_limiter.py` and `load-test/` — all were comfortably >=8 chars (e.g.
+  `"premium-partner"`, `"sim-isolation-key-a"`), so no existing value needed changing.
+- **`RequestValidationError`'s default error shape needed a fix** (see the architecture table
+  above) — not anticipated by the plan text, but required by its own "never echo the raw value"
+  invariant once composite-shape validation (duplicate types, wrong entry count, etc.) started
+  happening at the Pydantic `model_validator` layer, which FastAPI's default handler echoes `input`
+  for.
+- **Part 2 (endpoint groups) is now built** — see "Deviations from the Phase 5 Part 2 (groups)
+  plan" below.
+- **`load-test/test_rate_limiter_remote.py`'s pre-existing scenarios are still on the legacy
+  request form and remain broken against a redeployed backend** — they still send
+  `identifier_type`/`identifier_value` on every `/check` call (now a 422) and the preflight reads
+  `GET /rules`'s now-removed `identifier_type` response field. See `.claude/plans/phase5/plan.md`'s
+  "TODO before the next deployment" — this must be fixed before the next redeploy, not treated as
+  optional cleanup. The **new** Part 2 group scenario
+  (`run_group_dynamic_reload_scenario`) was added using the current composite `/check` shape
+  directly (`_check_composite`, a small local helper) rather than waiting on that migration, since
+  a group member can only be exercised through a real identifier type/value pair (`api_key` in this
+  case) and the composite form is the only one the backend still accepts.
+
+### Deviations from the Phase 5 Part 2 (groups) plan worth knowing about
+- **The member-write API was redesigned after the first pass** (this repo's `plan.md` reflects the
+  final shape, not the original draft). The original draft had `PUT /groups/{id}/members` (a
+  full-desired-set diff endpoint with a `dry_run` preview covering add/update/remove in one call)
+  and `POST /rules/{id}/detach` (no body, so a detached rule kept the group's last-known algorithm
+  and params as its own). This was requested to change to three narrower, single-purpose calls:
+  `POST /groups/{id}/members` (pure addition only — never touches or removes an existing member),
+  `DELETE /rules/{id}` / `PATCH /rules/{id}` with `overrides` (already-existing rules endpoints,
+  now doing double duty as "remove a member" / "update a member's overrides"), and
+  `PATCH /rules/{id}/detach` with a now-required `{algorithm, params}` body (a detaching group
+  member has no algorithm/params of its own once it's no longer inheriting the group's — the UI
+  prompts the user to choose both, rather than the backend silently carrying over the group's last
+  values). Net effect: no diff-preview response shape to maintain, and `RuleGroupService` has no
+  `remove_member`/`update_member` method at all — those two jobs were never really group-specific
+  operations, just per-rule ones that happen to also be legal on a grouped rule.
+- **`created_by`/`updated_by` were added to some group endpoints' request bodies** even though the
+  plan's illustrative bodies don't show them — `rules.created_by` is `NOT NULL`, and several
+  endpoints create fresh member `rules` rows, so an actor was required somewhere. `POST /groups`
+  takes `created_by` (mirrors `POST /rules`); `move-to-group` takes `updated_by` (mirrors
+  `PATCH /rules`'s naming). `POST /groups/{id}/members` deliberately has **no** actor field at all —
+  new member rules take the group's own `created_by` instead, since asking for one on a "just add
+  these endpoints" call felt like more ceremony than the operation warranted.
+- **`RuleGroupUpdateRequestDTO` and `RuleGroupCreateRequestDTO` use `extra="forbid"`** so an
+  attempt to set `algorithm_id`/`identifier_types` on `PATCH /groups/{id}` (immutable after
+  creation, per the plan) is a clean `422 VALIDATION_ERROR` rather than a silent no-op — the plan
+  called for guarding this but didn't specify the mechanism.
+- **`RuleRepository` gained two non-committing methods (`add`, `remove`) and `RuleGroupRepository`
+  is non-committing throughout** (`commit`/`rollback`/`flush` are explicit, caller-driven), unlike
+  `RuleRepository.create`/`update`/`delete`, which each commit immediately. Group operations touch
+  multiple rows (the group row plus N member `rules` rows) in one transaction — per the plan's
+  "one DB transaction that first locks the group row" requirement — so `RuleGroupService` owns the
+  commit/rollback boundary itself rather than each row committing independently. Plain single-rule
+  `/rules` CRUD is untouched and still commits per call.
+- **A real bug found and fixed during implementation: reading an ORM attribute after
+  `session.rollback()` raises `MissingGreenlet`, not a stale-value read.** `AsyncSession.rollback()`
+  expires every session-tracked attribute; accessing one afterward triggers a lazy-refresh, which
+  needs its own awaited DB round-trip and fails outside of one when done implicitly (e.g. building
+  a response object's fields from ORM attributes *after* calling `rollback()`). Fixed by building
+  every response/exception value from ORM attributes into plain locals *before* calling
+  `rollback()`, in both `RuleGroupService.add_members` (the conflict-list response) and
+  `move_to_group` (the `ScopeConflictError`'s `endpoint`/`identifier_signature` args) — see the
+  comments at both call sites.
+- **A second real bug found and fixed: `overrides: dict | None` with SQLAlchemy's default JSONB
+  type stores a Python `None` as the JSON literal `null`, not SQL `NULL`.** This silently violated
+  `ck_rules_overrides_requires_group` (`overrides IS NULL OR group_id IS NOT NULL`) on every
+  detach, since a JSONB column holding `null` doesn't satisfy `IS NULL`. Fixed by declaring the
+  column as `JSONB(none_as_null=True)` in `model/rule.py` — SQLAlchemy's per-column opt-in for
+  "Python `None` means SQL `NULL`" on JSON-typed columns. Worth checking for any future nullable
+  JSON/JSONB column.
+- **`move_to_group` locks the target group row (`FOR UPDATE`)** even though the plan doesn't
+  explicitly call this out for that operation (only for "group base edits and member changes") —
+  done for consistency with every other group-mutating path and because reading `group.params`/
+  `group.algorithm.name` to validate overrides is itself a read that should be consistent with a
+  concurrent base-params edit.
+- **`detach_rule` does bump `rule.version`, but still doesn't set `updated_by`** — `PATCH
+  /rules/{id}/detach`'s body is `{algorithm, params}` only, no actor field (see the API-redesign
+  bullet above), so there's nothing to attribute the change to; the version bump alone keeps
+  optimistic-concurrency semantics consistent with every other rule mutation.
+- **Group deletion doesn't validate the row's own FK-backed "can't delete with members" case at the
+  service layer** — `RuleGroupService.delete_group` always drains membership (detach or delete)
+  *before* deleting the group row, so the DB's `ON DELETE RESTRICT` on `rules.group_id` is never
+  actually hit in the normal path; it's a backstop for a bug, not part of the intended flow.
 
 ### Deviations from the original Phase 1/Improvisation spec worth knowing about
 - The `/check` request model lives in `dto/rate_limit_check_request.py`, not inlined in the
@@ -526,13 +898,13 @@ curl -i http://127.0.0.1:8000/health
 
 curl -i -X POST http://127.0.0.1:8000/api/v1/check \
   -H "Content-Type: application/json" \
-  -d '{"endpoint": "/api/v1/orders", "identifier_type": "api_key", "identifier_value": "api-key-abc123"}'
+  -d '{"endpoint": "/api/v1/orders", "identifiers": [{"type": "api_key", "value": "api-key-abc123"}]}'
 
 curl -i http://127.0.0.1:8000/api/v1/algorithms
 
 curl -i -X POST http://127.0.0.1:8000/api/v1/rules \
   -H "Content-Type: application/json" \
-  -d '{"endpoint": "/checkout", "identifier_type": "user_id", "algorithm_id": "<uuid from /algorithms>", "params": {"limit": 100}, "created_by": "jane.doe"}'
+  -d '{"endpoint": "/checkout", "identifier_types": ["user_id"], "algorithm_id": "<uuid from /algorithms>", "params": {"limit": 100}, "created_by": "jane.doe"}'
 ```
 
 See `README.md` for the full config YAML shape, Redis env vars, key-naming/TTL conventions, the
@@ -558,10 +930,20 @@ fail-open/fail-closed policy, and the response-field -> gateway-header mapping.
   an eviction policy to do (see `plan-part2.md`'s "why a plain in-memory cache" section).
 - Distributed/shared rules cache (Redis/Memcached) — each app instance keeps its own in-process
   copy; only revisit if that stops being viable.
-- `params`/`param_schema` JSON-Schema validation (validating `rules.params` against
-  `algorithms.params` server-side) — both columns exist but nothing enforces the relationship yet
-  (see plan.md's open questions). Until then, `RateLimiterService` treats a rule whose params
-  don't fit its algorithm as "unusable" and falls back to static config.
+- Full `params`/`param_schema` JSON-Schema validation (validating `rules.params` against
+  `algorithms.params`'s declared shape server-side) — **Phase 5 narrowed this gap** by validating
+  params at rule create/update time via `build_algorithm_config` (a missing/malformed param is now
+  a `422 INVALID_RULE_PARAMS` at write time), but that's engine-config-shape validation, not
+  JSON-Schema validation against the `algorithms.params` column itself; `RateLimiterService` still
+  treats a pre-existing rule whose params don't fit its algorithm as "unusable" and falls back to
+  static config at request time, as a defense-in-depth backstop.
+- Stacked limits (several rules all enforced on one `/check` request) — Phase 5's resolution picks
+  exactly one winning rule.
+- Groups holding more than one policy — two policies over the same endpoints means two groups.
+- Any UI for groups (a separate NiceGUI effort will consume the `/groups` API), OpenAPI import, or
+  auto-grouping of existing endpoints.
+- Identifier-hash-secret rotation — `IDENTIFIER_HASH_SECRET` is a single static value; changing it
+  resets every live rate-limit counter, by design, in this phase.
 
 This service can now run as **multiple instances/workers** sharing one Redis without their
 counters diverging — that's the point of this phase. The API gateway is still the one enforcing
@@ -570,6 +952,10 @@ the 429/headers on real traffic; this service only reports a decision.
 ## Working conventions for this project
 - Venv lives at `backend/venv`; install deps there (`./venv/bin/pip install -r requirements.txt`),
   never globally.
+- `IDENTIFIER_HASH_SECRET` (>=32 chars) must be set in `backend/.env` for the app (and therefore
+  any test that imports `core.settings` or boots the app) to even import — `Settings()` hard-fails
+  its constructor otherwise. `simulate_rate_limiter.py` and the test suite both rely on this being
+  present in `backend/.env` already; nothing sets it ad hoc per-test.
 - Tests: make sure your local Redis and Postgres are running (native/Homebrew installs on
   localhost — this project does not containerize its dependencies yet, despite the
   `docker-compose.yml` in the repo), then `./venv/bin/pytest` from `backend/`. Every Redis-touching
@@ -586,9 +972,14 @@ the 429/headers on real traffic; this service only reports a decision.
   `_reset_settings_after_test` fixture only resets `settings` back to real `os.environ` *between*
   tests (cleanup) — it doesn't help a test see its own env override take effect.
 - Rules-CRUD layering is `controller -> service -> repository -> model`, strictly: controllers
-  (`api/v1/endpoints/rules.py`, `algorithms.py`) never touch the DB session or ORM models directly;
-  services (`services/rule_service.py`, `algorithm_service.py`) own business rules and never build
-  SQL/ORM queries; repositories (`repositories/`) are dumb data access only.
+  (`api/v1/endpoints/rules.py`, `algorithms.py`, `groups.py`) never touch the DB session or ORM
+  models directly; services (`services/rule_service.py`, `algorithm_service.py`,
+  `rule_group_service.py`) own business rules and never build SQL/ORM queries; repositories
+  (`repositories/`) are dumb data access only. One deliberate exception for groups:
+  `RuleGroupRepository`'s methods (and `RuleRepository.add`/`remove`) don't commit — a
+  multi-row group operation is one DB transaction, so `RuleGroupService` owns the
+  commit/rollback boundary itself rather than each repository call committing independently
+  (see `backend/CLAUDE.md`'s Phase 5 Part 2 deviations).
 - New algorithm params go through the `AlgorithmConfig` discriminated union in
   `model/rate_limiter_config.py` — add a `Literal["YourAlgo"]`-discriminated Pydantic model, wire
   it into the `Union`, add the matching branch in `services/factory.py`, and write a

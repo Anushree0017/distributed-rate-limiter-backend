@@ -6,10 +6,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from api.health import router as health_router
-from api.v1.endpoints import algorithms, rate_limit, redis_health, rules, scripts
+from api.v1.endpoints import algorithms, groups, rate_limit, redis_health, rules, scripts
 from core.config_loader import load_rate_limiter_settings
 from core.db import dispose_engine
 from core.exceptions import register_exception_handlers
+from core.key_hasher import KeyHasher
 from core.logging import setup_logging
 from core.redis_client import create_redis_pool, get_redis_client, ping
 from core.scheduler import shutdown_scheduler, start_scheduler
@@ -56,12 +57,12 @@ async def lifespan(app: FastAPI):
     app.state.rules_cache = rules_cache
 
     logger.info("Loaded %d rate-limiting rule(s) from the database:", len(loaded_rules))
-    for rule in sorted(loaded_rules, key=lambda r: (r["endpoint"], r["identifier_type"], r["priority"])):
+    for rule in sorted(loaded_rules, key=lambda r: (r["endpoint"], r["identifier_signature"], r["priority"])):
         logger.info(
-            "  rule %s: endpoint=%s identifier_type=%s algorithm=%s params=%s status=%s priority=%d version=%d",
+            "  rule %s: endpoint=%s identifier_signature=%s algorithm=%s params=%s status=%s priority=%d version=%d",
             rule["id"],
             rule["endpoint"],
-            rule["identifier_type"],
+            rule["identifier_signature"],
             rule["algorithm_name"],
             rule["params"],
             rule["status"],
@@ -69,7 +70,8 @@ async def lifespan(app: FastAPI):
             rule["version"],
         )
 
-    app.state.rate_limiter_service = RateLimiterService(settings, redis_client, rules_cache=rules_cache)
+    hasher = KeyHasher(env_settings.get_identifier_hash_secret())
+    app.state.rate_limiter_service = RateLimiterService(settings, redis_client, hasher, rules_cache=rules_cache)
     logger.info(
         "Rate limiter service ready: fallback default=%s, %d DB rule(s) loaded",
         settings.default.config.algorithm,
@@ -95,6 +97,7 @@ app = FastAPI(title="Rate Limiter Service", lifespan=lifespan)
 app.include_router(rate_limit.router, prefix="/api/v1")
 app.include_router(redis_health.router, prefix="/api/v1")
 app.include_router(rules.router, prefix="/api/v1")
+app.include_router(groups.router, prefix="/api/v1")
 app.include_router(algorithms.router, prefix="/api/v1")
 app.include_router(scripts.router, prefix="/api/v1")
 app.include_router(health_router)

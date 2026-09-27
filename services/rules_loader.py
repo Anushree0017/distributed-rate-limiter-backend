@@ -6,6 +6,7 @@ import logging
 
 from core.db import get_session_factory
 from model.rule import Rule
+from model.rule_identifier_type import RULE_TO_ENGINE_IDENTIFIER_TYPE, RuleIdentifierType
 from repositories.rule_repository import RuleRepository
 from services.rules_cache import RulesCache
 
@@ -18,11 +19,34 @@ def _serialize_rule(rule: Rule) -> dict:
     `algorithm_name` is resolved here (via the eager-loaded `Rule.algorithm`
     relationship) so the rate limiter never needs a second lookup against
     `algorithms` on the request path.
+
+    `engine_identifier_types` bridges every element of `identifier_types`
+    (the rules-CRUD vocabulary) to the runtime `IdentifierType` vocabulary via
+    `RULE_TO_ENGINE_IDENTIFIER_TYPE` — `None` if any element has no runtime
+    mapping (stale data from a since-removed `RuleIdentifierType` member;
+    every current member has one), which `RulesCache` treats as unusable and
+    excludes from the resolution index rather than crashing the poll.
     """
+    engine_types = []
+    for identifier_type in rule.identifier_types:
+        engine_type = RULE_TO_ENGINE_IDENTIFIER_TYPE.get(identifier_type)
+        if engine_type is None:
+            logger.warning(
+                "Rule %s has identifier_type=%r with no runtime mapping; excluding from resolution index",
+                rule.id,
+                identifier_type,
+            )
+            engine_types = None
+            break
+        engine_types.append(engine_type)
+
     return {
         "id": str(rule.id),
         "endpoint": rule.endpoint,
-        "identifier_type": rule.identifier_type,
+        "identifier_types": list(rule.identifier_types),
+        "identifier_signature": rule.identifier_signature,
+        "is_global": rule.identifier_signature == RuleIdentifierType.GLOBAL.value,
+        "engine_identifier_types": frozenset(engine_types) if engine_types is not None else None,
         "algorithm_id": str(rule.algorithm_id),
         "algorithm_name": rule.algorithm.name,
         "params": dict(rule.params),

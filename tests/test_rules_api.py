@@ -26,7 +26,7 @@ async def _point_app_at_test_redis_and_clean_up(monkeypatch):
 
     engine = create_async_engine(get_test_database_url())
     async with engine.connect() as conn:
-        await conn.execute(text("TRUNCATE rule_history, rules RESTART IDENTITY CASCADE"))
+        await conn.execute(text("TRUNCATE rule_groups, rule_history, rules RESTART IDENTITY CASCADE"))
         await conn.commit()
     await engine.dispose()
 
@@ -59,7 +59,7 @@ def test_create_get_update_delete_rule_round_trip():
             "/api/v1/rules",
             json={
                 "endpoint": "/checkout",
-                "identifier_type": "user_id",
+                "identifier_types": ["user_id"],
                 "algorithm_id": algorithm_id,
                 "params": {"limit": 100, "window_seconds": 60},
                 "created_by": "jane.doe",
@@ -95,8 +95,9 @@ def test_create_conflicting_scope_returns_409():
         algorithm_id = _get_algorithm_id(client)
         body = {
             "endpoint": "/orders",
-            "identifier_type": "user_id",
+            "identifier_types": ["user_id"],
             "algorithm_id": algorithm_id,
+            "params": {"limit": 100, "window_seconds": 60},
             "created_by": "jane.doe",
         }
         first = client.post("/api/v1/rules", json=body)
@@ -113,7 +114,7 @@ def test_create_unknown_algorithm_returns_422():
             "/api/v1/rules",
             json={
                 "endpoint": "/orders",
-                "identifier_type": "global",
+                "identifier_types": ["global"],
                 "algorithm_id": "00000000-0000-0000-0000-000000000000",
                 "created_by": "jane.doe",
             },
@@ -135,8 +136,9 @@ def test_update_version_mismatch_returns_409():
             "/api/v1/rules",
             json={
                 "endpoint": "/orders",
-                "identifier_type": "global",
+                "identifier_types": ["global"],
                 "algorithm_id": algorithm_id,
+                "params": {"limit": 100, "window_seconds": 60},
                 "created_by": "jane.doe",
             },
         )
@@ -158,8 +160,9 @@ def test_list_rules_paginates():
                 "/api/v1/rules",
                 json={
                     "endpoint": f"/list-endpoint-{i}",
-                    "identifier_type": "global",
+                    "identifier_types": ["global"],
                     "algorithm_id": algorithm_id,
+                    "params": {"limit": 100, "window_seconds": 60},
                     "created_by": "jane.doe",
                 },
             )
@@ -169,3 +172,104 @@ def test_list_rules_paginates():
     body = response.json()
     assert body["total"] >= 3
     assert len(body["items"]) == 2
+
+
+def test_create_rule_with_composite_identifier_types():
+    with TestClient(app) as client:
+        algorithm_id = _get_algorithm_id(client)
+        response = client.post(
+            "/api/v1/rules",
+            json={
+                "endpoint": "/composite-endpoint",
+                "identifier_types": ["ip", "api_key"],
+                "algorithm_id": algorithm_id,
+                "params": {"limit": 100, "window_seconds": 60},
+                "created_by": "jane.doe",
+            },
+        )
+    assert response.status_code == 201
+    rule = response.json()
+    assert rule["identifier_types"] == ["api_key", "ip"]  # canonical: sorted
+    assert rule["identifier_signature"] == "api_key+ip"
+
+
+
+def test_create_rule_rejects_too_many_identifier_types():
+    with TestClient(app) as client:
+        algorithm_id = _get_algorithm_id(client)
+        response = client.post(
+            "/api/v1/rules",
+            json={
+                "endpoint": "/composite-endpoint",
+                "identifier_types": ["ip", "api_key", "user_id", "session_id"],
+                "algorithm_id": algorithm_id,
+                "params": {"limit": 100, "window_seconds": 60},
+                "created_by": "jane.doe",
+            },
+        )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "INVALID_IDENTIFIER_TYPES"
+
+
+def test_create_rule_rejects_global_combined_with_another_type():
+    with TestClient(app) as client:
+        algorithm_id = _get_algorithm_id(client)
+        response = client.post(
+            "/api/v1/rules",
+            json={
+                "endpoint": "/composite-endpoint",
+                "identifier_types": ["global", "api_key"],
+                "algorithm_id": algorithm_id,
+                "params": {"limit": 100, "window_seconds": 60},
+                "created_by": "jane.doe",
+            },
+        )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "INVALID_IDENTIFIER_TYPES"
+
+
+def test_create_rule_rejects_params_that_dont_fit_the_algorithm():
+    with TestClient(app) as client:
+        algorithm_id = _get_algorithm_id(client)  # FixedWindow: needs limit/window_seconds
+        response = client.post(
+            "/api/v1/rules",
+            json={
+                "endpoint": "/bad-params-endpoint",
+                "identifier_types": ["global"],
+                "algorithm_id": algorithm_id,
+                "params": {"totally": "wrong"},
+                "created_by": "jane.doe",
+            },
+        )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "INVALID_RULE_PARAMS"
+
+
+def test_composite_and_single_type_rules_coexist_on_the_same_endpoint():
+    """(endpoint, identifier_signature) uniqueness means an {api_key} rule
+    and an {api_key, ip} rule on the same endpoint don't conflict.
+    """
+    with TestClient(app) as client:
+        algorithm_id = _get_algorithm_id(client)
+        single = client.post(
+            "/api/v1/rules",
+            json={
+                "endpoint": "/shared-endpoint",
+                "identifier_types": ["api_key"],
+                "algorithm_id": algorithm_id,
+                "params": {"limit": 100, "window_seconds": 60},
+                "created_by": "jane.doe",
+            },
+        )
+        composite = client.post(
+            "/api/v1/rules",
+            json={
+                "endpoint": "/shared-endpoint",
+                "identifier_types": ["api_key", "ip"],
+                "algorithm_id": algorithm_id,
+                "params": {"limit": 50, "window_seconds": 60},
+                "created_by": "jane.doe",
+            },
+        )
+    assert single.status_code == 201
+    assert composite.status_code == 201
