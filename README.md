@@ -366,9 +366,9 @@ docker compose up -d postgres
 `DATABASE_URL` in `.env` (defaults to
 `postgresql+asyncpg://postgres:postgres@localhost:5432/rate_limiter`) points the app and Alembic
 at the same database. Migrations create `algorithms` (pre-seeded with `TokenBucket`,
-`FixedWindow`, `SlidingWindowLog`, `SlidingWindowCounter`, `LeakyBucket`), `rules`, and
+`FixedWindow`, `SlidingWindowLog`, `SlidingWindowCounter`, `LeakyBucket`), `rules`,
 `rule_history` (an append-only audit log, populated purely by a DB trigger — nothing in the app
-writes to it directly).
+writes to it directly), and `rule_groups` (Phase 5 Part 2 — see "Groups API" below).
 
 ### Endpoints (base path `/api/v1`)
 
@@ -376,11 +376,70 @@ writes to it directly).
 |-----------------------------|---------|
 | `GET /rules`                 | List rules, filterable by `endpoint`, `identifier_type` (legacy single-type, matches `identifier_signature` equality), `identifier_signature`, `status`, `algorithm_id`; paginated (`page`, `page_size`, max 100) |
 | `GET /rules/{id}`             | Fetch one rule |
-| `POST /rules`                 | Create a rule (`status` defaults to `active`, `version` to `1`) |
-| `PATCH /rules/{id}`           | Partial update (`params`, `priority`, `status`, `algorithm_id`); `expected_version` enables optimistic concurrency |
-| `DELETE /rules/{id}`          | Hard-delete; the final state is preserved in `rule_history` |
+| `POST /rules`                 | Create a standalone rule (`status` defaults to `active`, `version` to `1`); cannot set `group_id`/`overrides` — group membership only comes from the `/groups` endpoints below |
+| `PATCH /rules/{id}`           | Partial update (`params`, `priority`, `status`, `algorithm_id`, `overrides`); `expected_version` enables optimistic concurrency. On a **grouped** rule, `params`/`algorithm_id`/`priority` are rejected (`409 RULE_MANAGED_BY_GROUP`) — those are governed by the group; use `overrides` (replaces wholesale, recomputes effective `params`), `move-to-group`, or detach instead. `overrides` on a **standalone** rule is rejected (`422 OVERRIDES_REQUIRE_GROUP`). `status` is always allowed regardless of grouping |
+| `DELETE /rules/{id}`          | Hard-delete; the final state is preserved in `rule_history`. Allowed on a group member — the group stays intact (this is also how you remove one member from a group without detaching it) |
+| `PATCH /rules/{id}/detach`    | Detach a grouped rule; **body required**: `{algorithm: str, params: dict}` — a group member has no algorithm/params of its own to fall back to, so the caller (the UI, prompting the user) picks both at detach time. Clears `group_id`/`overrides`, sets `algorithm_id`/`params` from the body (validated via `build_algorithm_config`, `422 INVALID_RULE_PARAMS`/`422 ALGORITHM_NOT_FOUND` on a bad choice — detach then fails atomically). `identifier_types`/`identifier_signature` are left exactly as inherited from the group. UUID and `endpoint` unchanged. `409 RULE_NOT_IN_GROUP` on a standalone rule |
+| `POST /rules/{id}/move-to-group` | `{group_id, overrides?, updated_by}` — join (standalone) or re-parent (already grouped) a rule into a group. The target group's `algorithm`/`identifier_types`/`priority` fully replace the rule's own; the rule's UUID and `endpoint` never change. `409 SCOPE_CONFLICT` if another rule already holds `(endpoint, target_signature)` |
 | `GET /rules/identifiers`      | Static list of the 17 supported `identifier_type` values, for UI dropdowns |
 | `GET /algorithms`             | List available algorithms + their `param_schema` |
+
+### Groups API (Phase 5 Part 2)
+
+A **group** is one policy template (algorithm, identifier types, base `params`) applied to many
+endpoints. Each member endpoint is still a normal, flat `rules` row with its own UUID and Redis
+scope (`rules.group_id`) — a member can override individual base params (`rules.overrides`). The
+invariant, enforced server-side: `member.params == {**group.params, **member.overrides}`, and a
+member's `algorithm`/`identifier_types`/`priority` always equal the group's. `algorithm_id` and
+`identifier_types` are **immutable** after group creation (changing them would invalidate member
+overrides and reshape every member's Redis key) — moving members to a new/different group is the
+escape hatch. Group base edits and member changes each run in one DB transaction (the group row is
+locked `FOR UPDATE` first), so a base-params edit and its member fan-out are atomic. Group changes
+take effect at the next rules poll, exactly like any other rule change.
+
+| Method & path                        | Purpose |
+|----------------------------------------|---------|
+| `POST /groups`                          | Create a group; body: `name, description?, algorithm_id, identifier_types, params, priority?, created_by, members?: [{endpoint, overrides?}]`. `name` is unique, case-insensitive. Initial members are all-or-nothing — any per-endpoint conflict with an existing active rule fails the whole create (`409 GROUP_MEMBER_CONFLICT`) |
+| `GET /groups`                           | List groups (+ `member_count`); filter by `name_contains`; paginated |
+| `GET /groups/{id}`                      | Group + its members: `rule_id, endpoint, overrides, params` (effective), `is_active` |
+| `PATCH /groups/{id}`                    | `{name?, description?, params?, priority?, updated_by}` — `params`/`priority` changes recompute and update every member in the same transaction, in place (UUIDs unchanged, live Redis counters untouched). `algorithm_id`/`identifier_types` are rejected (`422`, `extra="forbid"`) |
+| `DELETE /groups/{id}?members=detach\|delete` | Default `detach`: members become standalone rules, keeping their current `params` (`group_id`/`overrides` cleared). `delete`: member rules are deleted too |
+| `POST /groups/{id}/members`             | `{members: [{endpoint, overrides?}]}` — **pure addition**: never touches or removes an existing member. All-or-nothing: any endpoint conflict (already holding an active rule for `(endpoint, identifier_signature)` elsewhere) reports every conflicting row and writes nothing. See "Add-members response" below |
+
+There's no bulk "replace the full member set" endpoint. The pieces above
+cover the same ground without a diff-preview response to maintain:
+- **Add members** → `POST /groups/{id}/members` above.
+- **Remove a member from its group** → `DELETE /rules/{id}` (leaves the
+  group intact) or `PATCH /rules/{id}/detach` if the rule itself should
+  survive standalone.
+- **Update an existing member's overrides** → `PATCH /rules/{id}` with
+  `overrides` (grouped rules only, per the guard above).
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/v1/groups \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "checkout-endpoints",
+    "algorithm_id": "<uuid from /algorithms>",
+    "identifier_types": ["api_key"],
+    "params": {"limit": 100, "window_seconds": 60},
+    "created_by": "jane.doe",
+    "members": [{"endpoint": "/checkout/start"}, {"endpoint": "/checkout/confirm", "overrides": {"limit": 20}}]
+  }'
+```
+
+#### Add-members response (`POST /groups/{id}/members`)
+
+```json
+{
+  "created":   [{"endpoint": "/items", "rule_id": "…", "overrides": {}}],
+  "conflicts": [{"endpoint": "/x", "reason": "…", "existing_rule_id": "…", "existing_group_id": null}]
+}
+```
+
+`201` on success (`conflicts` empty). `409` if any requested endpoint conflicts — `created` is then
+empty and nothing was written, even for the non-conflicting endpoints in the same request
+(all-or-nothing).
 
 ```bash
 curl -s http://127.0.0.1:8000/api/v1/algorithms
@@ -430,13 +489,21 @@ All 4xx/5xx responses from the rules-CRUD endpoints use:
 | `code`                | Status | When |
 |------------------------|--------|------|
 | `RULE_NOT_FOUND`        | 404    | Unknown rule id |
-| `ALGORITHM_NOT_FOUND`   | 422    | Unknown `algorithm_id` on create/update |
+| `ALGORITHM_NOT_FOUND`   | 422    | Unknown `algorithm_id` on create/update, or an unknown `algorithm` name on `PATCH /rules/{id}/detach` |
 | `VERSION_CONFLICT`      | 409    | `expected_version` doesn't match the current row |
 | `SCOPE_CONFLICT`        | 409    | An active rule already exists for the same `(endpoint, identifier_signature)` scope |
 | `INVALID_RULE_PARAMS`   | 422    | `params` don't fit the rule's algorithm (checked at write time) |
 | `INVALID_IDENTIFIER_TYPES` | 422 | `identifier_types` shape violation (count, duplicates, `global` combined with another type) |
 | `INVALID_IDENTIFIER_VALUE` | 422 | A `/check` identifier value fails its type's validator (never echoes the raw value) |
 | `VALIDATION_ERROR`      | 422    | Malformed request body (bad enum value, missing required field, etc.) — never echoes raw identifier values either |
+| `RULE_GROUP_NOT_FOUND`  | 404    | Unknown group id |
+| `GROUP_NAME_CONFLICT`   | 409    | A group with that `name` already exists (case-insensitive) |
+| `RULE_MANAGED_BY_GROUP` | 409    | `PATCH /rules/{id}` tried to set `params`/`algorithm_id`/`priority` on a grouped rule — use `overrides`, `move-to-group`, or detach |
+| `OVERRIDES_REQUIRE_GROUP` | 422  | `PATCH /rules/{id}` tried to set `overrides` on a standalone rule |
+| `RULE_NOT_IN_GROUP`     | 409    | `PATCH /rules/{id}/detach` on a rule that isn't a group member |
+| `INVALID_OVERRIDE_KEYS` | 422    | An override key doesn't exist in the group's base `params` (catches typos) |
+| `DUPLICATE_MEMBER_ENDPOINT` | 422 | The same `endpoint` appears twice in one `members` payload |
+| `GROUP_MEMBER_CONFLICT` | 409    | `POST /groups` with initial `members`: one or more endpoints already have an active rule outside this group (all-or-nothing) |
 
 ### How rules reach `/check`
 
@@ -458,19 +525,8 @@ Resolution order for a given `/check` request (identifiers provided as a set of 
 3. Else the static YAML `default` — also keyed off every identifier the request provided.
 
 For a single-identifier request this collapses to the pre-Phase-5 chain: exact type match, then
-`global`, then the static default.
-
-For a given `/check` request, `RateLimiterService` picks the limiter in this order:
-
-1. an **active** rule scoped to the request's exact `(endpoint, identifier_type)`
-2. else an **active** rule scoped to `(endpoint, "global")`
-3. else the static `config/rate_limits.yaml` entry for that endpoint (then its `default`)
-
-`identifier_type` for steps 1-2 comes straight from the `/check` request body — the Gateway
-states which attribute it's sending, so there's no priority/id tie-break needed (at most one
-active rule can exist per `(endpoint, identifier_type)`). A rule whose `params` don't fit its
-algorithm is skipped as if it didn't exist (falls through to the next step) rather than failing
-the request.
+`global`, then the static default. A rule whose `params` don't fit its algorithm is skipped as if
+it didn't exist (falls through to the next step) rather than failing the request.
 
 Rule param names (`limit`, `window_seconds`, `capacity`, `refill_rate`, `leak_rate`,
 `initial_tokens`) are the CRUD layer's own vocabulary and are translated to the engine's config

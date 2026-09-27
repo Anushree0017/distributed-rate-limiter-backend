@@ -64,8 +64,6 @@ Part 1 (composite identifiers) lands first because groups store
 - Stacked limits (several rules all enforced on one request).
 - Groups holding more than one policy. Two policies over the same endpoints =
   two groups.
-- Attaching an existing standalone rule to a group ("adopt"). A conflict is
-  reported, not auto-resolved. Possible follow-up.
 - Any UI (a separate NiceGUI effort will consume these APIs), OpenAPI import,
   auto-grouping.
 - Any change to Lua scripts, algorithm classes, the `RateLimiter` ABC, TTL
@@ -150,7 +148,8 @@ Part 1 (composite identifiers) lands first because groups store
   the poller, cache, and Lua path never learn groups exist.
 - `algorithm` and `identifier_types` are **immutable after group creation**
   (changing them would invalidate overrides and change Redis keys). Detaching
-  a member or creating a new group is the escape hatch.
+  a member, moving a rule to a different group, or creating a new group is the
+  escape hatch.
 - Group base edits and member changes run in one DB transaction that first
   locks the group row (`SELECT ... FOR UPDATE`). The cascade lives on the
   server, never in the UI.
@@ -344,6 +343,24 @@ Strictly layered like the rest of the CRUD side: repository (queries only),
   reject duplicates within one payload.
 - Detach: clear `group_id` and `overrides`, keep `params` and the UUID.
 - Delete group: `members=detach` (default) or `members=delete`.
+- **Move to group** (a rule joins a group, or switches from one group to
+  another; every rule — standalone or already grouped — supports this):
+  target group's `algorithm`, `identifier_types`/`identifier_signature`, and
+  `priority` fully replace the rule's own (a group member cannot diverge on
+  these). `overrides` defaults to `{}` on a move unless the caller supplies
+  new ones; the rule's pre-move params are discarded, not carried over as
+  overrides, since they were computed under a possibly different algorithm.
+  `params` is recomputed via `compute_effective_params` and validated via
+  `build_algorithm_config`, same as any other override write. The rule's UUID
+  and `endpoint` never change, so its Redis scope key stays stable; the key's
+  algorithm/signature fragments change if the group's do, which is expected
+  and matches how any other algorithm/type change already reshapes the key.
+  **Conflict check:** if the target group's `identifier_signature` differs
+  from the rule's current one, reject with 409 if another rule already holds
+  `(endpoint, target_signature)`. If the signature is unchanged (moving
+  between two groups with the same identifier types), no conflict is
+  possible, since the rule already legitimately holds that slot. Runs in one
+  transaction; on conflict, nothing is written.
 
 ### Step 10 — Groups API and rules-API guards
 
@@ -356,33 +373,68 @@ Router `api/v1/endpoints/groups.py`:
 | `GET /api/v1/groups/{id}` | group plus members: `rule_id, endpoint, overrides, effective params, is_active` |
 | `PATCH /api/v1/groups/{id}` | see Step 9 |
 | `DELETE /api/v1/groups/{id}?members=detach\|delete` | default `detach` |
-| `PUT /api/v1/groups/{id}/members` | body `{members: [{endpoint, overrides?}], dry_run?: bool}` |
-| `POST /api/v1/rules/{id}/detach` | detach one member; returns the rule |
+| `POST /api/v1/groups/{id}/members` | pure addition; body `{members: [{endpoint, overrides?}]}`; never touches or removes existing members |
+| `PATCH /api/v1/rules/{id}/detach` | detach one member; body `{algorithm: str, params: dict}` (required — see below); returns the rule |
+| `POST /api/v1/rules/{id}/move-to-group` | body `{group_id, overrides?: dict}`; works on a standalone rule (join) or a grouped rule (re-parent); see "Move to group" in Step 9 |
 
-`PUT .../members` response (used for the UI diff preview):
+There is no bulk "replace the full member set" endpoint (the plan originally
+specified `PUT /api/v1/groups/{id}/members` with a dry-run diff preview; this
+was removed as redundant once the pieces below cover the same ground without
+the extra diff-response shape to maintain):
+- **Add members** → `POST /api/v1/groups/{id}/members` above.
+- **Remove a member from its group** → `DELETE /rules/{id}` (already allowed
+  on a member; leaves the group intact) or `PATCH /rules/{id}/detach` if the
+  rule itself should survive as standalone.
+- **Update an existing member's overrides** → `PATCH /rules/{id}` with
+  `overrides` (already allowed for grouped rules; see the guards below).
+
+`POST /api/v1/groups/{id}/members` is all-or-nothing: each requested endpoint
+is validated (overrides must merge into a valid algorithm config, same as any
+other override write) and checked for a conflict — an endpoint that already
+holds an active rule for `(endpoint, identifier_signature)` elsewhere (a
+different group, or standalone). If *any* requested endpoint conflicts, every
+conflicting row is reported and nothing is written, even for the
+non-conflicting endpoints in the same request:
 
 ```json
 {
-  "dry_run": true,
-  "created":   [{"endpoint": "/items"}],
-  "updated":   [{"endpoint": "/orders", "rule_id": "…", "overrides": {"limit": 300}}],
-  "removed":   [{"endpoint": "/old", "rule_id": "…"}],
-  "unchanged": [{"endpoint": "/search", "rule_id": "…"}],
-  "conflicts": [{"endpoint": "/x", "reason": "endpoint already has a rule for api_key", "existing_rule_id": "…", "existing_group_id": null}]
+  "created":   [{"endpoint": "/items", "rule_id": "…", "overrides": {}}],
+  "conflicts": [{"endpoint": "/x", "reason": "endpoint already has an active rule for api_key", "existing_rule_id": "…", "existing_group_id": null}]
 }
 ```
 
-`dry_run: true` always returns 200 with the diff (conflicts included) and
-writes nothing. A real run with any conflict returns 409 with the same body
-and writes nothing.
+`201` on success (`conflicts` empty), `409` on any conflict (`created` empty,
+nothing written). No `dry_run` mode — the write itself is already cheap and
+all-or-nothing, so there's nothing a preview would save.
+
+**Detach** (`PATCH /rules/{id}/detach`) requires a body because a group
+member has no algorithm/params of its own to fall back to — the caller (in
+practice, the UI prompting the user) must pick both at detach time:
+- `{algorithm: str, params: dict}`, both required. `algorithm` is looked up
+  by name (422 `ALGORITHM_NOT_FOUND` if unknown); `params` is validated via
+  `build_algorithm_config` exactly like any other algorithm/params write —
+  422 on a bad combination, and detach fails atomically (nothing changes) if
+  validation fails.
+- Clears `group_id` and `overrides`; sets `algorithm_id`/`params` from the
+  body.
+- `identifier_types`/`identifier_signature` are left exactly as inherited
+  from the group — not part of what the caller chooses here.
+- The rule's UUID and `endpoint` never change, so its Redis scope survives;
+  the key's algorithm fragment changes if the chosen algorithm differs from
+  the group's, same as any other algorithm change.
+- `PATCH` (not `POST`) because this modifies an existing rule, matching
+  `PATCH /rules/{id}`'s verb.
 
 Guards on the existing rules API:
 - `POST /rules` cannot set `group_id` or `overrides` (members only come from
   group endpoints).
 - On a grouped rule, `PATCH params`, `algorithm`, and `identifier_types` are
-  rejected with 409 ("managed by group; use `overrides` or detach").
-  `PATCH overrides` is allowed for grouped rules only (replaces wholesale, then
-  recomputes `params`, validated as in Step 9). `is_active` stays per-rule.
+  rejected with 409 ("managed by group; use `overrides`, `move-to-group`, or
+  detach"). `PATCH overrides` is allowed for grouped rules only (replaces
+  wholesale, then recomputes `params`, validated as in Step 9). `is_active`
+  stays per-rule. `move-to-group` is the one path allowed to change a grouped
+  rule's algorithm/`identifier_types`, since it's changing which group governs
+  them, not editing them directly.
 - `DELETE /rules/{id}` on a member is allowed and leaves the group intact.
 - Rule responses include `group_id` and `overrides`.
 
@@ -390,10 +442,20 @@ Guards on the existing rules API:
 creates a group with 4 endpoints and 1 override; verifies each rule's
 effective `params`; PATCHes the base and verifies inheriting members changed
 while the overridden key did not; confirms member rule UUIDs are unchanged
-after every edit; dry-run then real `PUT` with an added, removed, and
-conflicting endpoint; detach one member; delete the group in both modes;
-confirm the poller loads the expanded rules and `/check` on a member endpoint
-returns the effective `limit` after the next poll.
+after every edit; adds new members via `POST .../members` (verifying existing
+members are untouched) and confirms an all-or-nothing conflict report writes
+nothing; removes a member via `DELETE /rules/{id}` and updates another's
+overrides via `PATCH /rules/{id}`; detaches one member with a chosen
+algorithm/params and confirms the rule keeps its UUID/endpoint but drops
+`group_id`/`overrides`; delete the group in both modes; confirm the poller
+loads the expanded rules and `/check` on a member endpoint returns the
+effective `limit` after the next poll; creates a standalone rule and moves it
+into a group (its algorithm/types/params become the group's, its UUID and
+endpoint are unchanged, and it now behaves as a normal member — inherits base
+edits, can take its own `overrides`); moves that rule again from one group to
+another; attempts a move that would conflict with an existing rule at
+`(endpoint, target_signature)` and confirms it's rejected with nothing
+written.
 
 ## Step 11 — Tests, simulator, docs
 
@@ -415,7 +477,7 @@ returns the effective `limit` after the next poll.
   interval; clean up in `try/finally`).
 - **Docs:** update `backend/CLAUDE.md` (architecture summary, deviation
   history, "explicitly out of scope" list gains stacked limits/multi-policy
-  groups/adopt/secret rotation), `backend/README.md` (new `/check` shape,
+  groups/secret rotation), `backend/README.md` (new `/check` shape,
   groups API, `IDENTIFIER_HASH_SECRET`), and `prd_architecture.md` (new key
   format, resolution order, new invariant on not logging values).
 
@@ -476,4 +538,7 @@ classes (only the key fragment they receive changes), `interfaces/base.py`,
   behave as specified, verified through `/check`.
 - A group with an overridden member can have its base edited without changing
   member UUIDs or losing live counters.
+- Every rule, whether created standalone or already in a group, can move into
+  a (different) group via `move-to-group`, and every group member can detach
+  back to standalone — both without changing the rule's UUID or endpoint.
 - `backend/CLAUDE.md` records every deviation made while implementing.

@@ -20,3 +20,7 @@ class AlgorithmRepository:
 
     async def get_by_id(self, algorithm_id: uuid.UUID) -> Algorithm | None:
         return await self._session.get(Algorithm, algorithm_id)
+
+    async def get_by_name(self, name: str) -> Algorithm | None:
+        result = await self._session.execute(select(Algorithm).where(Algorithm.name == name))
+        return result.scalar_one_or_none()

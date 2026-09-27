@@ -25,6 +25,18 @@ class AlgorithmNotFoundError(Exception):
         super().__init__(f"Algorithm {algorithm_id} not found")
 
 
+class AlgorithmNameNotFoundError(Exception):
+    """Like `AlgorithmNotFoundError`, but for the name-based lookup
+    `PATCH /rules/{id}/detach` uses (the caller picks an algorithm by name,
+    not id, since a group member has no `algorithm_id` of its own to default
+    to once detached).
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        super().__init__(f"Algorithm named {name!r} not found")
+
+
 class VersionConflictError(Exception):
     def __init__(self, rule_id, expected_version, actual_version):
         self.rule_id = rule_id
@@ -43,6 +55,78 @@ class ScopeConflictError(Exception):
             f"An active rule already exists for endpoint={endpoint!r}, "
             f"identifier_signature={identifier_signature!r}"
         )
+
+
+class RuleGroupNotFoundError(Exception):
+    def __init__(self, group_id):
+        self.group_id = group_id
+        super().__init__(f"Rule group {group_id} not found")
+
+
+class GroupNameConflictError(Exception):
+    def __init__(self, name: str):
+        self.name = name
+        super().__init__(f"A rule group named {name!r} already exists (case-insensitive)")
+
+
+class RuleManagedByGroupError(Exception):
+    """A grouped rule's `algorithm`, `params`, or `priority` were targeted by
+    a direct `PATCH /rules/{id}` — those are governed by the group; the
+    caller must use `overrides`, `move-to-group`, or `detach` instead.
+    """
+
+    def __init__(self, rule_id):
+        self.rule_id = rule_id
+        super().__init__(
+            f"Rule {rule_id} is managed by a group; use `overrides`, `move-to-group`, or detach"
+        )
+
+
+class OverridesRequireGroupError(Exception):
+    def __init__(self, rule_id):
+        self.rule_id = rule_id
+        super().__init__(f"Rule {rule_id} is standalone; `overrides` only apply to grouped rules")
+
+
+class RuleNotInGroupError(Exception):
+    def __init__(self, rule_id):
+        self.rule_id = rule_id
+        super().__init__(f"Rule {rule_id} is not a member of any group")
+
+
+class InvalidOverrideKeysError(Exception):
+    """An override key doesn't exist in the group's base params (catches
+    typos rather than silently accepting a param the algorithm never sees).
+    """
+
+    def __init__(self, unknown_keys: list[str]):
+        self.unknown_keys = unknown_keys
+        super().__init__(f"Override key(s) not present in base params: {unknown_keys}")
+
+
+class DuplicateMemberEndpointError(Exception):
+    def __init__(self, endpoint: str):
+        self.endpoint = endpoint
+        super().__init__(f"Duplicate endpoint in members payload: {endpoint!r}")
+
+
+class GroupMemberConflictError(Exception):
+    """Raised by group creation (with initial members) when one or more
+    requested endpoints already have an active rule outside this group.
+    All-or-nothing: nothing was written.
+    """
+
+    def __init__(self, conflicts: list[dict]):
+        self.conflicts = conflicts
+        super().__init__("One or more member endpoints conflict with an existing rule")
+
+
+class MembersWriteRaceError(Exception):
+    """A racing unique-constraint violation slipped past the service-layer
+    pre-check during `POST /groups/{id}/members`'s (or `POST /groups`'s
+    initial-members) write phase. Backstop only — the pre-check conflict
+    list is the normal path.
+    """
 
 
 class InvalidRuleParamsError(Exception):
@@ -76,6 +160,10 @@ def register_exception_handlers(app: FastAPI) -> None:
             422, "ALGORITHM_NOT_FOUND", str(exc), {"algorithm_id": str(exc.algorithm_id)}
         )
 
+    @app.exception_handler(AlgorithmNameNotFoundError)
+    async def _algorithm_name_not_found(request: Request, exc: AlgorithmNameNotFoundError) -> JSONResponse:
+        return _error_response(422, "ALGORITHM_NOT_FOUND", str(exc), {"algorithm_name": exc.name})
+
     @app.exception_handler(VersionConflictError)
     async def _version_conflict(request: Request, exc: VersionConflictError) -> JSONResponse:
         return _error_response(
@@ -106,6 +194,42 @@ def register_exception_handlers(app: FastAPI) -> None:
         return _error_response(
             422, "INVALID_RULE_PARAMS", str(exc), {"algorithm_name": exc.algorithm_name}
         )
+
+    @app.exception_handler(RuleGroupNotFoundError)
+    async def _rule_group_not_found(request: Request, exc: RuleGroupNotFoundError) -> JSONResponse:
+        return _error_response(404, "RULE_GROUP_NOT_FOUND", str(exc), {"group_id": str(exc.group_id)})
+
+    @app.exception_handler(GroupNameConflictError)
+    async def _group_name_conflict(request: Request, exc: GroupNameConflictError) -> JSONResponse:
+        return _error_response(409, "GROUP_NAME_CONFLICT", str(exc), {"name": exc.name})
+
+    @app.exception_handler(RuleManagedByGroupError)
+    async def _rule_managed_by_group(request: Request, exc: RuleManagedByGroupError) -> JSONResponse:
+        return _error_response(409, "RULE_MANAGED_BY_GROUP", str(exc), {"rule_id": str(exc.rule_id)})
+
+    @app.exception_handler(OverridesRequireGroupError)
+    async def _overrides_require_group(request: Request, exc: OverridesRequireGroupError) -> JSONResponse:
+        return _error_response(422, "OVERRIDES_REQUIRE_GROUP", str(exc), {"rule_id": str(exc.rule_id)})
+
+    @app.exception_handler(RuleNotInGroupError)
+    async def _rule_not_in_group(request: Request, exc: RuleNotInGroupError) -> JSONResponse:
+        return _error_response(409, "RULE_NOT_IN_GROUP", str(exc), {"rule_id": str(exc.rule_id)})
+
+    @app.exception_handler(InvalidOverrideKeysError)
+    async def _invalid_override_keys(request: Request, exc: InvalidOverrideKeysError) -> JSONResponse:
+        return _error_response(422, "INVALID_OVERRIDE_KEYS", str(exc), {"unknown_keys": exc.unknown_keys})
+
+    @app.exception_handler(DuplicateMemberEndpointError)
+    async def _duplicate_member_endpoint(request: Request, exc: DuplicateMemberEndpointError) -> JSONResponse:
+        return _error_response(422, "DUPLICATE_MEMBER_ENDPOINT", str(exc), {"endpoint": exc.endpoint})
+
+    @app.exception_handler(GroupMemberConflictError)
+    async def _group_member_conflict(request: Request, exc: GroupMemberConflictError) -> JSONResponse:
+        return _error_response(409, "GROUP_MEMBER_CONFLICT", str(exc), {"conflicts": exc.conflicts})
+
+    @app.exception_handler(MembersWriteRaceError)
+    async def _members_write_race(request: Request, exc: MembersWriteRaceError) -> JSONResponse:
+        return _error_response(409, "GROUP_MEMBER_CONFLICT", "A concurrent write conflicted with this request; retry")
 
     @app.exception_handler(InvalidIdentifierTypesError)
     async def _invalid_identifier_types(request: Request, exc: InvalidIdentifierTypesError) -> JSONResponse:

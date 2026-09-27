@@ -26,7 +26,7 @@ async def _point_app_at_test_redis_and_clean_up(monkeypatch):
 
     engine = create_async_engine(get_test_database_url())
     async with engine.connect() as conn:
-        await conn.execute(text("TRUNCATE rule_history, rules RESTART IDENTITY CASCADE"))
+        await conn.execute(text("TRUNCATE rule_groups, rule_history, rules RESTART IDENTITY CASCADE"))
         await conn.commit()
     await engine.dispose()
 

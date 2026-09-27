@@ -67,6 +67,24 @@ class RuleRepository:
         await self._session.delete(rule)
         await self._session.commit()
 
+    async def list_by_group(self, group_id: uuid.UUID) -> list[Rule]:
+        result = await self._session.execute(
+            select(Rule).where(Rule.group_id == group_id).options(selectinload(Rule.algorithm))
+        )
+        return list(result.scalars().all())
+
+    def add(self, rule: Rule) -> None:
+        """Non-committing add — used by `RuleGroupService`, which owns the
+        transaction boundary for multi-row group operations (see its
+        docstring). Plain single-rule CRUD (`create`) commits immediately;
+        this is for the group-transaction path only.
+        """
+        self._session.add(rule)
+
+    async def remove(self, rule: Rule) -> None:
+        """Non-committing delete — group-transaction counterpart to `delete`."""
+        await self._session.delete(rule)
+
     async def list_all(self) -> list[Rule]:
         """Every row, unpaginated, algorithm eager-loaded — used by
         `services/rules_loader.py` to populate `RulesCache` at startup and on

@@ -21,7 +21,12 @@ class RuleCreateRequestDTO(BaseModel):
     every caller was migrated to `identifier_types` — see
     `.claude/plans/phase5/plan.md`'s "Removed: legacy single-identifier
     request form".
+
+    `extra="forbid"`: `group_id`/`overrides` aren't settable here — group
+    membership only comes from the `/groups` endpoints (Phase 5 Part 2).
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     endpoint: str
     identifier_types: list[RuleIdentifierType]
@@ -38,12 +43,18 @@ class RuleUpdateRequestDTO(BaseModel):
     """All fields optional except `updated_by`, per the API contract.
     Identifier types are immutable after creation (changing them would
     change the rule's Redis key shape) — create a new rule instead.
+
+    Phase 5 Part 2: `overrides` replaces wholesale and is only valid for a
+    grouped rule (`RuleService` rejects it otherwise). On a grouped rule,
+    `algorithm_id`/`params`/`priority` are rejected — those are governed by
+    the group; use `overrides`, `move-to-group`, or detach instead.
     """
 
     algorithm_id: uuid.UUID | None = None
     params: dict | None = None
     priority: int | None = None
     status: RuleStatus | None = None
+    overrides: dict | None = None
     updated_by: str
     expected_version: int | None = None
 
@@ -60,6 +71,8 @@ class RuleResponseDTO(BaseModel):
     status: str
     priority: int
     version: int
+    group_id: uuid.UUID | None
+    overrides: dict | None
     created_by: str
     updated_by: str | None
     created_at: datetime

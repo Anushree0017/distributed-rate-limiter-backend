@@ -10,6 +10,8 @@ from sqlalchemy.exc import IntegrityError
 from core.exceptions import (
     AlgorithmNotFoundError,
     InvalidRuleParamsError,
+    OverridesRequireGroupError,
+    RuleManagedByGroupError,
     RuleNotFoundError,
     ScopeConflictError,
     VersionConflictError,
@@ -18,14 +20,22 @@ from dto.rule_dto import RuleCreateRequestDTO, RuleFilter, RuleUpdateRequestDTO
 from model.rule import Rule
 from model.rule_status import RuleStatus
 from repositories.algorithm_repository import AlgorithmRepository
+from repositories.rule_group_repository import RuleGroupRepository
 from repositories.rule_repository import RuleRepository
+from services.group_params import validate_overrides_or_raise
 from services.rule_algorithm_mapper import UnsupportedRuleAlgorithmError, build_algorithm_config
 
 
 class RuleService:
-    def __init__(self, repository: RuleRepository, algorithm_repository: AlgorithmRepository):
+    def __init__(
+        self,
+        repository: RuleRepository,
+        algorithm_repository: AlgorithmRepository,
+        group_repository: RuleGroupRepository,
+    ):
         self._repository = repository
         self._algorithm_repository = algorithm_repository
+        self._group_repository = group_repository
 
     async def _validate_params_or_raise(self, algorithm_id: uuid.UUID, params: dict) -> None:
         algorithm = await self._algorithm_repository.get_by_id(algorithm_id)
@@ -71,10 +81,29 @@ class RuleService:
         if data.expected_version is not None and data.expected_version != rule.version:
             raise VersionConflictError(rule_id, data.expected_version, rule.version)
 
-        new_algorithm_id = data.algorithm_id if data.algorithm_id is not None else rule.algorithm_id
-        if data.algorithm_id is not None or data.params is not None:
-            new_params = data.params if data.params is not None else rule.params
-            await self._validate_params_or_raise(new_algorithm_id, new_params)
+        is_grouped = rule.group_id is not None
+
+        # Phase 5 Part 2: a grouped rule's algorithm/params/priority are
+        # governed by its group (invariant: they equal the group's) — direct
+        # edits here are rejected; use `overrides`, `move-to-group`, or
+        # detach instead. `overrides`, conversely, only make sense on a
+        # grouped rule.
+        if is_grouped and (data.algorithm_id is not None or data.params is not None or data.priority is not None):
+            raise RuleManagedByGroupError(rule_id)
+        if not is_grouped and data.overrides is not None:
+            raise OverridesRequireGroupError(rule_id)
+
+        new_params = None
+        if is_grouped:
+            if data.overrides is not None:
+                group = await self._group_repository.get_by_id(rule.group_id)
+                new_params = validate_overrides_or_raise(group.algorithm.name, group.params, data.overrides)
+        else:
+            new_algorithm_id = data.algorithm_id if data.algorithm_id is not None else rule.algorithm_id
+            if data.algorithm_id is not None or data.params is not None:
+                candidate_params = data.params if data.params is not None else rule.params
+                await self._validate_params_or_raise(new_algorithm_id, candidate_params)
+                new_params = candidate_params
 
         # Resolve every candidate value into locals first, and only assign
         # them onto `rule` once we're done validating — `rule` is already
@@ -91,12 +120,15 @@ class RuleService:
             if conflict is not None:
                 raise ScopeConflictError(rule.endpoint, rule.identifier_signature)
 
-        if data.algorithm_id is not None:
-            rule.algorithm_id = data.algorithm_id
-        if data.params is not None:
-            rule.params = data.params
-        if data.priority is not None:
-            rule.priority = data.priority
+        if not is_grouped:
+            if data.algorithm_id is not None:
+                rule.algorithm_id = data.algorithm_id
+            if data.priority is not None:
+                rule.priority = data.priority
+        if new_params is not None:
+            rule.params = new_params
+        if is_grouped and data.overrides is not None:
+            rule.overrides = data.overrides
         rule.status = new_status
         rule.updated_by = data.updated_by
         rule.version += 1

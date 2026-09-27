@@ -77,7 +77,7 @@ async def redis_client():
 #
 #     docker exec <postgres-container> psql -U postgres -c "CREATE DATABASE rate_limiter_test;"
 #
-# Migrations run once per test session; `rules`/`rule_history` are truncated
+# Migrations run once per test session; `rules`/`rule_history`/`rule_groups` are truncated
 # after every test so tests never see each other's rows. `algorithms` is
 # left alone — it's seeded reference data, not per-test state.
 # ---------------------------------------------------------------------------
@@ -116,7 +116,7 @@ def _run_migrations():
     async def _clear_rules():
         engine = create_async_engine(get_test_database_url())
         async with engine.connect() as conn:
-            await conn.execute(text("TRUNCATE rule_history, rules RESTART IDENTITY CASCADE"))
+            await conn.execute(text("TRUNCATE rule_groups, rule_history, rules RESTART IDENTITY CASCADE"))
             await conn.commit()
         await engine.dispose()
 
@@ -182,6 +182,6 @@ async def db_session():
             yield session
         finally:
             await session.rollback()
-            await session.execute(text("TRUNCATE rule_history, rules RESTART IDENTITY CASCADE"))
+            await session.execute(text("TRUNCATE rule_groups, rule_history, rules RESTART IDENTITY CASCADE"))
             await session.commit()
     await engine.dispose()

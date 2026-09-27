@@ -30,8 +30,8 @@ def _rule(**overrides) -> Rule:
     return Rule(**defaults)
 
 
-def _service(rule_repo=None, algorithm_repo=None) -> RuleService:
-    return RuleService(rule_repo or AsyncMock(), algorithm_repo or AsyncMock())
+def _service(rule_repo=None, algorithm_repo=None, group_repo=None) -> RuleService:
+    return RuleService(rule_repo or AsyncMock(), algorithm_repo or AsyncMock(), group_repo or AsyncMock())
 
 
 async def test_create_rejects_unknown_algorithm():

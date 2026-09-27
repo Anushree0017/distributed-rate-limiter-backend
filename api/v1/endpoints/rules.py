@@ -5,10 +5,12 @@ import uuid
 
 from fastapi import APIRouter, Depends, Query, status
 
-from core.dependencies import get_rule_service
+from core.dependencies import get_rule_group_service, get_rule_service
 from dto.rule_dto import RuleCreateRequestDTO, RuleFilter, RuleListResponse, RuleResponseDTO, RuleUpdateRequestDTO
+from dto.rule_group_dto import DetachRuleRequestDTO, MoveToGroupRequestDTO
 from model.rule_identifier_type import RuleIdentifierType
 from model.rule_status import RuleStatus
+from services.rule_group_service import RuleGroupService
 from services.rule_service import RuleService
 
 router = APIRouter(prefix="/rules")
@@ -73,3 +75,23 @@ async def update_rule(
 @router.delete("/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_rule(rule_id: uuid.UUID, service: RuleService = Depends(get_rule_service)) -> None:
     await service.delete_rule(rule_id)
+
+
+@router.patch("/{rule_id}/detach", response_model=RuleResponseDTO)
+async def detach_rule(
+    rule_id: uuid.UUID,
+    payload: DetachRuleRequestDTO,
+    service: RuleGroupService = Depends(get_rule_group_service),
+) -> RuleResponseDTO:
+    rule = await service.detach_rule(rule_id, payload)
+    return RuleResponseDTO.model_validate(rule)
+
+
+@router.post("/{rule_id}/move-to-group", response_model=RuleResponseDTO)
+async def move_rule_to_group(
+    rule_id: uuid.UUID,
+    payload: MoveToGroupRequestDTO,
+    service: RuleGroupService = Depends(get_rule_group_service),
+) -> RuleResponseDTO:
+    rule = await service.move_to_group(rule_id, payload)
+    return RuleResponseDTO.model_validate(rule)
