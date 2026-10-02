@@ -1,10 +1,12 @@
 import pytest
 from sqlalchemy.exc import IntegrityError
 
+import model.rule_group  # noqa: F401 — mapper-registers the `rule_groups` FK target when this file runs standalone
 from dto.rule_dto import RuleFilter
 from model.rule import Rule
 from model.rule_status import RuleStatus
 from repositories.algorithm_repository import AlgorithmRepository
+from repositories.client_repository import ClientRepository
 from repositories.rule_repository import RuleRepository
 
 
@@ -13,9 +15,15 @@ async def _an_algorithm_id(db_session):
     return algorithms[0].id
 
 
-def _make_rule(algorithm_id, **overrides) -> Rule:
+async def _a_client_id(db_session):
+    client = await ClientRepository(db_session).get_by_client_id("default")
+    return client.id
+
+
+def _make_rule(algorithm_id, client_id, **overrides) -> Rule:
     identifier_types = overrides.pop("identifier_types", None) or [overrides.pop("identifier_type", "user_id")]
     defaults = dict(
+        client_id=client_id,
         endpoint="/checkout",
         identifier_types=identifier_types,
         identifier_signature="+".join(sorted(identifier_types)),
@@ -32,9 +40,10 @@ def _make_rule(algorithm_id, **overrides) -> Rule:
 
 async def test_create_and_get_by_id(db_session):
     algorithm_id = await _an_algorithm_id(db_session)
+    client_id = await _a_client_id(db_session)
     repo = RuleRepository(db_session)
 
-    created = await repo.create(_make_rule(algorithm_id))
+    created = await repo.create(_make_rule(algorithm_id, client_id))
     assert created.id is not None
     assert created.algorithm.id == algorithm_id
 
@@ -52,46 +61,51 @@ async def test_get_by_id_returns_none_when_missing(db_session):
 
 async def test_active_scope_uniqueness_is_enforced_by_the_db(db_session):
     algorithm_id = await _an_algorithm_id(db_session)
+    client_id = await _a_client_id(db_session)
     repo = RuleRepository(db_session)
-    await repo.create(_make_rule(algorithm_id))
+    await repo.create(_make_rule(algorithm_id, client_id))
 
     with pytest.raises(IntegrityError):
-        await repo.create(_make_rule(algorithm_id))
+        await repo.create(_make_rule(algorithm_id, client_id))
 
 
 async def test_inactive_rule_does_not_block_a_new_active_rule_in_same_scope(db_session):
     algorithm_id = await _an_algorithm_id(db_session)
+    client_id = await _a_client_id(db_session)
     repo = RuleRepository(db_session)
-    first = await repo.create(_make_rule(algorithm_id))
+    first = await repo.create(_make_rule(algorithm_id, client_id))
     first.status = RuleStatus.INACTIVE.value
     await repo.update(first)
 
-    second = await repo.create(_make_rule(algorithm_id))
+    second = await repo.create(_make_rule(algorithm_id, client_id))
     assert second.id != first.id
 
 
 async def test_global_scope_is_a_single_slot(db_session):
     algorithm_id = await _an_algorithm_id(db_session)
+    client_id = await _a_client_id(db_session)
     repo = RuleRepository(db_session)
-    await repo.create(_make_rule(algorithm_id, identifier_type="global"))
+    await repo.create(_make_rule(algorithm_id, client_id, identifier_type="global"))
 
     with pytest.raises(IntegrityError):
-        await repo.create(_make_rule(algorithm_id, identifier_type="global"))
+        await repo.create(_make_rule(algorithm_id, client_id, identifier_type="global"))
 
 
 async def test_find_active_conflict_excludes_given_id(db_session):
     algorithm_id = await _an_algorithm_id(db_session)
+    client_id = await _a_client_id(db_session)
     repo = RuleRepository(db_session)
-    rule = await repo.create(_make_rule(algorithm_id))
+    rule = await repo.create(_make_rule(algorithm_id, client_id))
 
-    assert await repo.find_active_conflict("/checkout", "user_id") is not None
-    assert await repo.find_active_conflict("/checkout", "user_id", exclude_id=rule.id) is None
+    assert await repo.find_active_conflict(client_id, "/checkout", "user_id") is not None
+    assert await repo.find_active_conflict(client_id, "/checkout", "user_id", exclude_id=rule.id) is None
 
 
 async def test_delete_removes_the_row(db_session):
     algorithm_id = await _an_algorithm_id(db_session)
+    client_id = await _a_client_id(db_session)
     repo = RuleRepository(db_session)
-    rule = await repo.create(_make_rule(algorithm_id))
+    rule = await repo.create(_make_rule(algorithm_id, client_id))
 
     await repo.delete(rule)
 
@@ -100,9 +114,10 @@ async def test_delete_removes_the_row(db_session):
 
 async def test_list_filters_and_paginates(db_session):
     algorithm_id = await _an_algorithm_id(db_session)
+    client_id = await _a_client_id(db_session)
     repo = RuleRepository(db_session)
     for i in range(3):
-        await repo.create(_make_rule(algorithm_id, endpoint=f"/endpoint-{i}"))
+        await repo.create(_make_rule(algorithm_id, client_id, endpoint=f"/endpoint-{i}"))
 
     items, total = await repo.list(RuleFilter(page=1, page_size=2))
     assert total == 3

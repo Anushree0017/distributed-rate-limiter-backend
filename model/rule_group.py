@@ -13,6 +13,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from core.db import Base
 from model.algorithm import Algorithm
+from model.client import Client
 
 
 class RuleGroup(Base):
@@ -21,7 +22,13 @@ class RuleGroup(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
-    # Uniqueness is case-insensitive, enforced by a functional unique index
+    # Phase 6: every group belongs to exactly one client, same ON DELETE
+    # RESTRICT rationale as `Rule.client_id`. A rule's `client_id` must equal
+    # its group's `client_id` — enforced in `RuleGroupService`, not the DB.
+    client_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("clients.id", ondelete="RESTRICT"), nullable=False
+    )
+    # Uniqueness is case-insensitive *per client*, enforced by a functional unique index
     # (`ux_rule_groups_name_ci`, on lower(name)) rather than a plain UNIQUE
     # column constraint — see the migration.
     name: Mapped[str] = mapped_column(String, nullable=False)
@@ -45,3 +52,6 @@ class RuleGroup(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     algorithm: Mapped["Algorithm"] = relationship(lazy="raise")
+    # Eagerly joined — `dto.rule_group_dto.build_rule_group_response` reads
+    # `.client.client_id` (the public slug), same rationale as `Rule.client`.
+    client: Mapped["Client"] = relationship(lazy="raise")

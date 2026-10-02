@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from api.health import router as health_router
-from api.v1.endpoints import algorithms, groups, rate_limit, redis_health, rules, scripts
+from api.v1.endpoints import algorithms, auth, clients, groups, rate_limit, redis_health, rules, scripts
 from core.config_loader import load_rate_limiter_settings
 from core.db import dispose_engine
 from core.exceptions import register_exception_handlers
@@ -14,7 +14,10 @@ from core.key_hasher import KeyHasher
 from core.logging import setup_logging
 from core.redis_client import create_redis_pool, get_redis_client, ping
 from core.scheduler import shutdown_scheduler, start_scheduler
+from core.security.tokens import TokenService
 from core.settings import settings as env_settings
+from services.clients_cache import ClientsCache
+from services.clients_loader import load_clients_into_cache
 from services.rate_limiter.script_loader import register_all_scripts
 from services.rate_limiter_service import RateLimiterService
 from services.rules_cache import RulesCache
@@ -26,6 +29,11 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Pure-settings construction (reads the signing keyring, no I/O) — built
+    # once up front so `require_scope`/the token endpoint never rebuild it
+    # per request. See core/security/tokens.py.
+    app.state.token_service = TokenService()
+
     redis_pool = create_redis_pool()
     redis_client = get_redis_client(redis_pool)
 
@@ -70,6 +78,16 @@ async def lifespan(app: FastAPI):
             rule["version"],
         )
 
+    # Clients cache must also be fully loaded before traffic is served — same
+    # hard-fail-at-boot stance as the rules cache. `/check`'s auth dependency
+    # (core/dependencies.require_scope) only ever consults this in-memory
+    # cache, never Postgres directly (Phase 6 invariant: zero DB/Redis calls
+    # for authentication on the request path).
+    clients_cache = ClientsCache()
+    loaded_clients = await load_clients_into_cache(clients_cache)
+    app.state.clients_cache = clients_cache
+    logger.info("Loaded %d client(s) from the database", len(loaded_clients))
+
     hasher = KeyHasher(env_settings.get_identifier_hash_secret())
     app.state.rate_limiter_service = RateLimiterService(settings, redis_client, hasher, rules_cache=rules_cache)
     logger.info(
@@ -78,7 +96,7 @@ async def lifespan(app: FastAPI):
         rules_cache.stats()["rule_count"],
     )
 
-    start_scheduler(rules_cache)
+    start_scheduler(rules_cache, clients_cache)
 
     yield
 
@@ -94,10 +112,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Rate Limiter Service", lifespan=lifespan)
+app.include_router(auth.router, prefix="/api/v1")
 app.include_router(rate_limit.router, prefix="/api/v1")
 app.include_router(redis_health.router, prefix="/api/v1")
 app.include_router(rules.router, prefix="/api/v1")
 app.include_router(groups.router, prefix="/api/v1")
+app.include_router(clients.router, prefix="/api/v1")
 app.include_router(algorithms.router, prefix="/api/v1")
 app.include_router(scripts.router, prefix="/api/v1")
 app.include_router(health_router)

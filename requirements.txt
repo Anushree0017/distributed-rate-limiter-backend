@@ -9,5 +9,7 @@ apscheduler
 sqlalchemy[asyncio]>=2.0
 asyncpg
 alembic
+PyJWT
+python-multipart
 pytest
 pytest-asyncio

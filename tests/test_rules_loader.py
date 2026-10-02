@@ -7,8 +7,10 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+import model.rule_group  # noqa: F401 — ensures the `rule_groups` FK target is mapper-registered when this file runs standalone
 from core.settings import settings
 from repositories.algorithm_repository import AlgorithmRepository
+from repositories.client_repository import ClientRepository
 from repositories.rule_repository import RuleRepository
 from services.rules_cache import RulesCache
 from services.rules_loader import fetch_all_rules_from_db, load_rules_into_cache
@@ -37,8 +39,10 @@ async def test_fetch_all_rules_from_db_returns_plain_dicts(db_session):
     from model.rule import Rule
     from model.rule_status import RuleStatus
 
+    default_client = await ClientRepository(db_session).get_by_client_id("default")
     await RuleRepository(db_session).create(
         Rule(
+            client_id=default_client.id,
             endpoint="/checkout",
             identifier_types=["user_id"],
             identifier_signature="user_id",
@@ -56,6 +60,7 @@ async def test_fetch_all_rules_from_db_returns_plain_dicts(db_session):
     rule = rules[0]
     assert isinstance(rule["id"], str)
     assert rule["endpoint"] == "/checkout"
+    assert rule["client_pk"] == str(default_client.id)
     assert rule["algorithm_name"] == algorithm.name
     assert rule["params"] == {"limit": 5}
 
@@ -68,8 +73,10 @@ async def test_load_rules_into_cache_replaces_cache_and_returns_rules(db_session
     from model.rule import Rule
     from model.rule_status import RuleStatus
 
+    default_client = await ClientRepository(db_session).get_by_client_id("default")
     await RuleRepository(db_session).create(
         Rule(
+            client_id=default_client.id,
             endpoint="/checkout",
             identifier_types=["user_id"],
             identifier_signature="user_id",
@@ -87,14 +94,14 @@ async def test_load_rules_into_cache_replaces_cache_and_returns_rules(db_session
     loaded = await load_rules_into_cache(cache)
 
     assert len(loaded) == 1
-    assert cache.get_candidates("/checkout") != []
+    assert cache.get_candidates(str(default_client.id), "/checkout") != []
 
 
 async def test_load_rules_into_cache_raises_on_failure(monkeypatch):
     from model.identifier import IdentifierType
 
     cache = RulesCache()
-    cache.load_all([{"id": "keep-me", "endpoint": "/x", "identifier_types": ["global"],
+    cache.load_all([{"id": "keep-me", "client_pk": "cp-1", "endpoint": "/x", "identifier_types": ["global"],
                       "identifier_signature": "global", "is_global": True,
                       "engine_identifier_types": frozenset({IdentifierType.ENDPOINT}),
                       "algorithm_id": "a", "algorithm_name": "FixedWindow",

@@ -17,6 +17,8 @@ from sqlalchemy.exc import IntegrityError
 from core.exceptions import (
     AlgorithmNameNotFoundError,
     AlgorithmNotFoundError,
+    ClientNotFoundError,
+    CrossClientOperationError,
     DuplicateMemberEndpointError,
     GroupMemberConflictError,
     GroupNameConflictError,
@@ -43,6 +45,7 @@ from model.rule import Rule
 from model.rule_group import RuleGroup
 from model.rule_status import RuleStatus
 from repositories.algorithm_repository import AlgorithmRepository
+from repositories.client_repository import ClientRepository
 from repositories.rule_group_repository import RuleGroupRepository
 from repositories.rule_repository import RuleRepository
 from services.group_params import validate_overrides_or_raise
@@ -55,10 +58,25 @@ class RuleGroupService:
         group_repository: RuleGroupRepository,
         rule_repository: RuleRepository,
         algorithm_repository: AlgorithmRepository,
+        client_repository: ClientRepository,
     ):
         self._groups = group_repository
         self._rules = rule_repository
         self._algorithms = algorithm_repository
+        self._clients = client_repository
+
+    async def _resolve_client_or_raise(self, client_id: str):
+        client = await self._clients.get_by_client_id(client_id)
+        if client is None:
+            raise ClientNotFoundError(client_id)
+        return client
+
+    async def resolve_client_pk(self, client_id: str):
+        """Public so the controller can translate a `?client_id=<slug>`
+        query filter into the internal PK `RuleGroupFilter.client_pk`
+        expects, without the controller touching `ClientRepository` directly.
+        """
+        return (await self._resolve_client_or_raise(client_id)).id
 
     # -- reads -----------------------------------------------------------
 
@@ -84,11 +102,13 @@ class RuleGroupService:
         return group, members
 
     async def list_groups(self, filters: RuleGroupFilter) -> tuple[list[tuple[RuleGroup, int]], int]:
-        return await self._groups.list_groups(filters.name_contains, filters.page, filters.page_size)
+        return await self._groups.list_groups(filters.client_pk, filters.name_contains, filters.page, filters.page_size)
 
     # -- create ------------------------------------------------------------
 
     async def create_group(self, data: RuleGroupCreateRequestDTO) -> RuleGroup:
+        client = await self._resolve_client_or_raise(data.client_id)
+
         algorithm = await self._algorithms.get_by_id(data.algorithm_id)
         if algorithm is None:
             raise AlgorithmNotFoundError(data.algorithm_id)
@@ -99,11 +119,12 @@ class RuleGroupService:
         # (overrides={} is the trivial merge case).
         validate_overrides_or_raise(algorithm.name, data.params, {})
 
-        existing = await self._groups.get_by_name_ci(data.name)
+        existing = await self._groups.get_by_name_ci(client.id, data.name)
         if existing is not None:
             raise GroupNameConflictError(data.name)
 
         group = RuleGroup(
+            client_id=client.id,
             name=data.name,
             description=data.description,
             algorithm_id=data.algorithm_id,
@@ -128,7 +149,7 @@ class RuleGroupService:
         prepared: list[tuple[str, dict, dict]] = []
         for member in members:
             merged = validate_overrides_or_raise(algorithm.name, data.params, member.overrides)
-            conflict = await self._rules.find_active_conflict(member.endpoint, identifier_signature)
+            conflict = await self._rules.find_active_conflict(client.id, member.endpoint, identifier_signature)
             if conflict is not None:
                 conflicts.append(
                     {
@@ -147,6 +168,7 @@ class RuleGroupService:
 
         for endpoint, overrides, merged_params in prepared:
             rule = Rule(
+                client_id=client.id,
                 endpoint=endpoint,
                 identifier_types=identifier_types,
                 identifier_signature=identifier_signature,
@@ -167,7 +189,7 @@ class RuleGroupService:
             await self._groups.rollback()
             raise MembersWriteRaceError()
 
-        await self._groups.refresh(group, attribute_names=["algorithm"])
+        await self._groups.refresh(group, attribute_names=["algorithm", "client"])
         return group
 
     # -- update base ---------------------------------------------------
@@ -178,7 +200,7 @@ class RuleGroupService:
             raise RuleGroupNotFoundError(group_id)
 
         if data.name is not None and data.name != group.name:
-            existing = await self._groups.get_by_name_ci(data.name, exclude_id=group_id)
+            existing = await self._groups.get_by_name_ci(group.client_id, data.name, exclude_id=group_id)
             if existing is not None:
                 await self._groups.rollback()
                 raise GroupNameConflictError(data.name)
@@ -212,7 +234,7 @@ class RuleGroupService:
             member.version += 1
 
         await self._groups.commit()
-        await self._groups.refresh(group, attribute_names=["algorithm"])
+        await self._groups.refresh(group, attribute_names=["algorithm", "client"])
         return group
 
     # -- members ---------------------------------------------------------
@@ -240,7 +262,7 @@ class RuleGroupService:
         prepared: list[tuple[str, dict, dict]] = []
         for member in data.members:
             merged = validate_overrides_or_raise(group.algorithm.name, group.params, member.overrides)
-            conflict = await self._rules.find_active_conflict(member.endpoint, group.identifier_signature)
+            conflict = await self._rules.find_active_conflict(group.client_id, member.endpoint, group.identifier_signature)
             if conflict is not None:
                 conflicts.append(
                     MemberConflictEntry(
@@ -260,6 +282,7 @@ class RuleGroupService:
         new_rules: list[Rule] = []
         for endpoint, overrides, merged in prepared:
             rule = Rule(
+                client_id=group.client_id,
                 endpoint=endpoint,
                 identifier_types=group.identifier_types,
                 identifier_signature=group.identifier_signature,
@@ -347,12 +370,16 @@ class RuleGroupService:
         if group is None:
             raise RuleGroupNotFoundError(data.group_id)
 
+        if rule.client_id != group.client_id:
+            # Capture before any rollback — see the lazy-refresh note below.
+            raise CrossClientOperationError(rule_id, data.group_id)
+
         overrides = data.overrides if data.overrides is not None else {}
         merged = validate_overrides_or_raise(group.algorithm.name, group.params, overrides)
 
         if group.identifier_signature != rule.identifier_signature:
             conflict = await self._rules.find_active_conflict(
-                rule.endpoint, group.identifier_signature, exclude_id=rule.id
+                rule.client_id, rule.endpoint, group.identifier_signature, exclude_id=rule.id
             )
             if conflict is not None:
                 # Capture before rollback() — rollback expires session-tracked

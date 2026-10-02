@@ -26,6 +26,10 @@ class GroupMemberInputDTO(BaseModel):
 class RuleGroupCreateRequestDTO(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Phase 6: the owning client's public slug — resolved to its internal PK
+    # server-side. Every member rule created with this group takes the same
+    # client (the group-invariant: a rule's client_id equals its group's).
+    client_id: str
     name: str
     description: str | None = None
     algorithm_id: uuid.UUID
@@ -84,6 +88,7 @@ class RuleGroupResponseDTO(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
+    client_id: str
     name: str
     description: str | None
     algorithm: AlgorithmSummaryResponseDTO
@@ -95,6 +100,16 @@ class RuleGroupResponseDTO(BaseModel):
     updated_by: str | None
     created_at: datetime
     updated_at: datetime
+
+
+def build_rule_group_response(group) -> RuleGroupResponseDTO:
+    """Same rationale as `dto.rule_dto.build_rule_response` — see its
+    docstring for why this can't just be `model_validate` +
+    `model_copy(update=...)`.
+    """
+    data = {field: getattr(group, field) for field in RuleGroupResponseDTO.model_fields if field != "client_id"}
+    data["client_id"] = group.client.client_id
+    return RuleGroupResponseDTO.model_validate(data)
 
 
 class RuleGroupListItemDTO(RuleGroupResponseDTO):
@@ -121,6 +136,7 @@ class RuleGroupListResponse(BaseModel):
 
 
 class RuleGroupFilter(BaseModel):
+    client_pk: uuid.UUID | None = None
     name_contains: str | None = None
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=20, ge=1, le=100)

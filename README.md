@@ -129,12 +129,18 @@ keys are never evicted early under memory pressure — see redis_guidelines.md �
 ```
 REDIS_URL=redis://localhost:6379/0
 IDENTIFIER_HASH_SECRET=<a random string, at least 32 characters>
+AUTH_JWT_SIGNING_KEYS={"kid1": "<a random string, at least 32 characters>"}
+AUTH_JWT_ACTIVE_KID=kid1
 ```
 
 `IDENTIFIER_HASH_SECRET` HMAC-hashes identifier values into Redis keys (see "Composite
 identifiers" below) — the app **will not start** without it, same stance as `REDIS_URL`. Generate
 one with e.g. `python3 -c "import secrets; print(secrets.token_hex(32))"`. Every app instance
 sharing one Redis must use the identical value.
+
+`AUTH_JWT_SIGNING_KEYS`/`AUTH_JWT_ACTIVE_KID` are the token-signing keyring — see
+"Authentication" below. Same stance: required, hard-fails boot if missing/short, every instance
+issuing or verifying tokens must share the identical keyring.
 
 Optional pool tuning (sane defaults if unset):
 
@@ -187,15 +193,21 @@ Decided once, centrally, in `RateLimiterService.check_rate_limit`:
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 docker compose up -d redis postgres
-./venv/bin/alembic upgrade head        # create + seed the rules/algorithms tables
+./venv/bin/alembic upgrade head        # create + seed the clients/rules/algorithms tables
+./venv/bin/python scripts/create_client.py admin-cli "Admin CLI" --scopes admin
 ./venv/bin/uvicorn main:app --reload
 ```
 
 Postgres connection: `DATABASE_URL` in `.env` (defaults to
 `postgresql+asyncpg://postgres:postgres@localhost:5432/rate_limiter`). The app **will not start**
-if Redis is unreachable, or if the initial load of all rules from Postgres into the in-memory
-cache fails. `RULES_POLL_INTERVAL_SECONDS` (default `60`) controls how often that cache re-polls
-Postgres for rule changes — see "How rules reach `/check`".
+if Redis is unreachable, or if the initial load of all rules (or all clients) from Postgres into
+their in-memory caches fails. `RULES_POLL_INTERVAL_SECONDS` (default `60`) controls how often the
+rules cache re-polls Postgres for rule changes — see "How rules reach `/check`".
+`CLIENTS_POLL_INTERVAL_SECONDS` (default `60`) is the equivalent for the clients cache — the
+bound on how quickly disabling a client (or revoking a scope) takes effect for already-issued
+tokens. See "Authentication" below for the bootstrap step
+(`scripts/create_client.py`) — every other client, and every rule/group, can only be created
+through the (now auth-protected) API once this first admin client exists.
 
 ## Logging
 
@@ -210,6 +222,51 @@ LOG_LEVEL=DEBUG
 - `DEBUG`: every check (allow or deny) and factory instantiation details — noisy, local/dev only.
 - `ERROR`: config validation failures at startup, unexpected backend errors during a check, and
   any other unhandled exception.
+
+## Authentication
+
+Every endpoint except `GET /health` and `POST /api/v1/auth/token` requires a bearer token:
+`Authorization: Bearer <token>`. Tokens are short-lived signed JWTs (HS256, default TTL 600s),
+obtained via OAuth2 client-credentials. Two scopes: `check` (for `POST /api/v1/check` only) and
+`admin` (for everything else — rules, groups, clients, algorithms, scripts, redis diagnostics).
+A client is registered with a subset of `{check, admin}` and can only ever request a token for
+scopes it's registered for.
+
+**Getting a token:**
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/v1/auth/token \
+  -d grant_type=client_credentials -d client_id=my-service -d client_secret=<secret>
+# -> {"access_token": "...", "token_type": "Bearer", "expires_in": 600, "scope": "check"}
+```
+
+HTTP Basic (`-u my-service:<secret>` with `grant_type=client_credentials` as the only form field)
+works too. Cache the token and refresh at ~80% of `expires_in` — don't fetch a new one per
+request. Unknown client, wrong secret, expired/revoked secret, and a disabled client all return
+the *same* `401 {"error": "invalid_client", ...}` (RFC 6749 shape) — none of those cases is
+distinguishable from the outside, by design.
+
+**Bootstrapping the first admin client** (the clients admin API itself requires an admin token,
+so something must exist first):
+
+```bash
+./venv/bin/python scripts/create_client.py admin-cli "Admin CLI" --scopes admin
+# prints the client's secret once — save it, it's not recoverable afterward
+```
+
+That client can then register every other client via `POST /api/v1/clients` (see "Clients API"
+below), including the `check`-scoped one your API gateway/Lambda actually calls `/check` with.
+
+**Revocation:** disabling a client (`PATCH /api/v1/clients/{id}` with `status: disabled`) blocks
+new token issuance immediately and invalidates its *already-issued* tokens within one
+`CLIENTS_POLL_INTERVAL_SECONDS` (default 60s) — verification checks an in-memory cache of client
+status/scopes on every request, not just the token's own signature. Revoking one secret (of up to
+two active per client) doesn't invalidate tokens already issued from it; it only blocks minting
+new ones with that secret.
+
+**TLS:** bearer tokens and client secrets must only travel over TLS in any real deployment — this
+service itself doesn't terminate TLS (that's the gateway/load balancer's job), so plain-HTTP is
+only acceptable inside a trusted local/dev network.
 
 ## API
 
@@ -372,11 +429,18 @@ writes to it directly), and `rule_groups` (Phase 5 Part 2 — see "Groups API" b
 
 ### Endpoints (base path `/api/v1`)
 
+All of the following require `Authorization: Bearer <token>` with `admin` scope — see
+"Authentication" above. Every rule/group belongs to exactly one **client** (multi-tenant,
+Phase 6): `POST /rules`/`POST /groups` take a `client_id` (the public client slug, not the
+internal PK) and `GET /rules`/`GET /groups` accept it as a filter; responses echo the slug back.
+Two different clients may each hold a rule for the same `(endpoint, identifier_signature)`
+without conflicting — only a duplicate *within* one client is rejected.
+
 | Method & path              | Purpose |
 |-----------------------------|---------|
-| `GET /rules`                 | List rules, filterable by `endpoint`, `identifier_type` (legacy single-type, matches `identifier_signature` equality), `identifier_signature`, `status`, `algorithm_id`; paginated (`page`, `page_size`, max 100) |
+| `GET /rules`                 | List rules, filterable by `client_id`, `endpoint`, `identifier_type` (legacy single-type, matches `identifier_signature` equality), `identifier_signature`, `status`, `algorithm_id`; paginated (`page`, `page_size`, max 100) |
 | `GET /rules/{id}`             | Fetch one rule |
-| `POST /rules`                 | Create a standalone rule (`status` defaults to `active`, `version` to `1`); cannot set `group_id`/`overrides` — group membership only comes from the `/groups` endpoints below |
+| `POST /rules`                 | Create a standalone rule for `client_id` (`status` defaults to `active`, `version` to `1`); cannot set `group_id`/`overrides` — group membership only comes from the `/groups` endpoints below |
 | `PATCH /rules/{id}`           | Partial update (`params`, `priority`, `status`, `algorithm_id`, `overrides`); `expected_version` enables optimistic concurrency. On a **grouped** rule, `params`/`algorithm_id`/`priority` are rejected (`409 RULE_MANAGED_BY_GROUP`) — those are governed by the group; use `overrides` (replaces wholesale, recomputes effective `params`), `move-to-group`, or detach instead. `overrides` on a **standalone** rule is rejected (`422 OVERRIDES_REQUIRE_GROUP`). `status` is always allowed regardless of grouping |
 | `DELETE /rules/{id}`          | Hard-delete; the final state is preserved in `rule_history`. Allowed on a group member — the group stays intact (this is also how you remove one member from a group without detaching it) |
 | `PATCH /rules/{id}/detach`    | Detach a grouped rule; **body required**: `{algorithm: str, params: dict}` — a group member has no algorithm/params of its own to fall back to, so the caller (the UI, prompting the user) picks both at detach time. Clears `group_id`/`overrides`, sets `algorithm_id`/`params` from the body (validated via `build_algorithm_config`, `422 INVALID_RULE_PARAMS`/`422 ALGORITHM_NOT_FOUND` on a bad choice — detach then fails atomically). `identifier_types`/`identifier_signature` are left exactly as inherited from the group. UUID and `endpoint` unchanged. `409 RULE_NOT_IN_GROUP` on a standalone rule |
@@ -477,6 +541,22 @@ Note: a rule-definition `identifier_type`/`identifier_types` is unrelated to (bu
 vocabulary with) the `/check` request's identifier fields — the `/check` fields describe one
 incoming call's caller attribute(s), while a rule's identifier types describe which attribute(s)
 the rule's policy applies to.
+
+### Clients API (Phase 6, `admin` scope)
+
+| Method & path              | Purpose |
+|-----------------------------|---------|
+| `POST /clients`              | Register a client: `{client_id, name, description?, scopes}`. Returns the client **and its first secret in plaintext, once** (`client_secret` field) — there's no other way to retrieve it afterward |
+| `GET /clients`                | List clients, paginated |
+| `GET /clients/{client_id}`    | Fetch one client |
+| `PATCH /clients/{client_id}`  | Update `name`/`description`/`scopes`/`status`; `client_id` itself is immutable (`extra="forbid"` — attempting to change it is a `422`) |
+| `GET /clients/{client_id}/secrets` | List a client's secrets (metadata only — `secret_hint`, timestamps, never the plaintext) |
+| `POST /clients/{client_id}/secrets` | Issue a new secret, returned in plaintext once (`secret` field). `409 TOO_MANY_ACTIVE_SECRETS` if the client already has two active (the cap that keeps rotation zero-downtime: add a second, update your caller, then revoke the first) |
+| `DELETE /clients/{client_id}/secrets/{secret_id}` | Revoke a secret. `409 LAST_ACTIVE_SECRET` if it's the client's only active one and the client is itself still `active` (disable the client first, or add another secret) |
+
+Hard-deleting a client isn't offered — disable it instead (`PATCH` with `status: disabled`); it
+still owns rules/groups (`ON DELETE RESTRICT`), and disabling blocks its tokens within one
+`CLIENTS_POLL_INTERVAL_SECONDS` same as described in "Authentication" above.
 
 ### Error envelope
 

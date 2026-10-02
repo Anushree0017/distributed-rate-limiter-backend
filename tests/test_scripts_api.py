@@ -8,7 +8,7 @@ from redis.exceptions import RedisError
 
 from core.settings import settings
 from main import app
-from tests.conftest import get_test_redis_url
+from tests.conftest import admin_auth_headers, check_auth_headers, get_test_redis_url
 
 _SCRIPTS_DIR = Path(__file__).parent.parent / "services" / "rate_limiter" / "scripts"
 _SCRIPT_NAMES = sorted(path.stem for path in _SCRIPTS_DIR.glob("*.lua"))
@@ -18,7 +18,7 @@ def test_reload_scripts_returns_every_registered_script_name(monkeypatch):
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
     settings.reload()
     with TestClient(app) as client:
-        response = client.post("/api/v1/scripts/reload")
+        response = client.post("/api/v1/scripts/reload", headers=admin_auth_headers())
 
     assert response.status_code == 200
     body = response.json()
@@ -36,10 +36,10 @@ def test_reload_scripts_leaves_scripts_invocable(monkeypatch):
     }
 
     with TestClient(app) as client:
-        reload_response = client.post("/api/v1/scripts/reload")
+        reload_response = client.post("/api/v1/scripts/reload", headers=admin_auth_headers())
         assert reload_response.status_code == 200
 
-        check_response = client.post("/api/v1/check", json=payload)
+        check_response = client.post("/api/v1/check", json=payload, headers=check_auth_headers())
 
     assert check_response.status_code == 200
     assert check_response.json()["allowed"] is True
@@ -54,7 +54,7 @@ def test_reload_scripts_returns_503_on_registration_failure(monkeypatch):
 
         monkeypatch.setattr(client.app.state.redis_client, "script_load", _boom)
 
-        response = client.post("/api/v1/scripts/reload")
+        response = client.post("/api/v1/scripts/reload", headers=admin_auth_headers())
 
     assert response.status_code == 503
     body = response.json()

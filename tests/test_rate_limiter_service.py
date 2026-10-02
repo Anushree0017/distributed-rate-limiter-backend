@@ -24,10 +24,14 @@ def _settings() -> RateLimiterSettings:
     )
 
 
+_CLIENT_PK = "cp-1"
+
+
 def _token_bucket_rule(**overrides) -> dict:
     identifier_types = overrides.pop("identifier_types", ["global"])
     defaults = dict(
         id="rule-orders",
+        client_pk=_CLIENT_PK,
         endpoint="/api/v1/orders",
         identifier_types=identifier_types,
         identifier_signature="+".join(sorted(identifier_types)),
@@ -59,29 +63,49 @@ def _check(endpoint: str, identifier_type: str, value: str) -> RateLimitCheckReq
 async def test_uses_matching_db_rule_for_known_endpoint(redis_client):
     service = RateLimiterService(_settings(), redis_client, _HASHER, rules_cache=_cache(_token_bucket_rule()))
 
-    result = await service.check_rate_limit(_check("/api/v1/orders", "client_id", "client-1"))
+    result = await service.check_rate_limit(_CLIENT_PK, _check("/api/v1/orders", "client_id", "client-1"))
     assert result.allowed is True
     # TokenBucket capacity=1, so a second immediate call is blocked.
-    result = await service.check_rate_limit(_check("/api/v1/orders", "client_id", "client-1"))
+    result = await service.check_rate_limit(_CLIENT_PK, _check("/api/v1/orders", "client_id", "client-1"))
     assert result.allowed is False
 
 
 async def test_falls_back_to_default_for_unknown_endpoint(redis_client):
     service = RateLimiterService(_settings(), redis_client, _HASHER, rules_cache=_cache())
 
-    result = await service.check_rate_limit(_check("/api/v1/unknown", "client_id", "client-1"))
+    result = await service.check_rate_limit(_CLIENT_PK, _check("/api/v1/unknown", "client_id", "client-1"))
     assert result.allowed is True
-    result = await service.check_rate_limit(_check("/api/v1/unknown", "client_id", "client-1"))
+    result = await service.check_rate_limit(_CLIENT_PK, _check("/api/v1/unknown", "client_id", "client-1"))
     assert result.allowed is False
 
 
 async def test_clients_are_isolated_within_an_endpoint(redis_client):
     service = RateLimiterService(_settings(), redis_client, _HASHER, rules_cache=_cache(_token_bucket_rule()))
 
-    result_a = await service.check_rate_limit(_check("/api/v1/orders", "client_id", "a"))
-    result_b = await service.check_rate_limit(_check("/api/v1/orders", "client_id", "b"))
+    result_a = await service.check_rate_limit(_CLIENT_PK, _check("/api/v1/orders", "client_id", "a"))
+    result_b = await service.check_rate_limit(_CLIENT_PK, _check("/api/v1/orders", "client_id", "b"))
     assert result_a.allowed is True
     assert result_b.allowed is True
+
+
+async def test_tenant_clients_are_isolated_across_the_same_endpoint(redis_client):
+    """Phase 6: two different authenticated clients hitting the same rule
+    endpoint, with the same caller identifier, get independent buckets —
+    exhausting one client's bucket leaves the other at full limit.
+    """
+    service = RateLimiterService(
+        _settings(), redis_client, _HASHER, rules_cache=_cache(_token_bucket_rule(client_pk="tenant-a"))
+    )
+
+    # tenant-a has a matching rule; tenant-b (no rule under that client_pk)
+    # falls back to the static default — both still isolated from each other.
+    result_a1 = await service.check_rate_limit("tenant-a", _check("/api/v1/orders", "client_id", "same-caller"))
+    assert result_a1.allowed is True
+    result_a2 = await service.check_rate_limit("tenant-a", _check("/api/v1/orders", "client_id", "same-caller"))
+    assert result_a2.allowed is False  # tenant-a's TokenBucket (capacity=1) now exhausted
+
+    result_b1 = await service.check_rate_limit("tenant-b", _check("/api/v1/orders", "client_id", "same-caller"))
+    assert result_b1.allowed is True  # tenant-b's own (default) bucket, unaffected by tenant-a
 
 
 class _ExplodingLimiter(RateLimiter):
@@ -94,9 +118,9 @@ class _ExplodingLimiter(RateLimiter):
 
 async def test_fails_open_with_degraded_flag_on_redis_connection_error(redis_client):
     service = RateLimiterService(_settings(), redis_client, _HASHER)
-    service._default_limiter = _ExplodingLimiter(RedisConnectionError("backend unavailable"))
+    service._build_default_limiter = lambda client_pk: _ExplodingLimiter(RedisConnectionError("backend unavailable"))
 
-    result = await service.check_rate_limit(_check("/api/v1/unknown", "client_id", "client-1"))
+    result = await service.check_rate_limit(_CLIENT_PK, _check("/api/v1/unknown", "client_id", "client-1"))
 
     assert result.allowed is True
     assert result.degraded is True
@@ -104,7 +128,7 @@ async def test_fails_open_with_degraded_flag_on_redis_connection_error(redis_cli
 
 async def test_response_error_propagates_instead_of_failing_open(redis_client):
     service = RateLimiterService(_settings(), redis_client, _HASHER)
-    service._default_limiter = _ExplodingLimiter(RedisResponseError("wrong number of KEYS"))
+    service._build_default_limiter = lambda client_pk: _ExplodingLimiter(RedisResponseError("wrong number of KEYS"))
 
     with pytest.raises(RedisResponseError):
-        await service.check_rate_limit(_check("/api/v1/unknown", "client_id", "client-1"))
+        await service.check_rate_limit(_CLIENT_PK, _check("/api/v1/unknown", "client_id", "client-1"))

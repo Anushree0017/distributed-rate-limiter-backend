@@ -9,6 +9,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from core.settings import settings
+from services.clients_cache import ClientsCache
+from services.clients_loader import load_clients_into_cache
 from services.rules_cache import RulesCache
 from services.rules_loader import load_rules_into_cache
 
@@ -30,7 +32,19 @@ async def _run_scheduled_rules_poll(cache: RulesCache) -> None:
         logger.exception("Rules poll cycle failed; will retry next interval")
 
 
-def start_scheduler(rules_cache: RulesCache) -> None:
+async def _run_scheduled_clients_poll(cache: ClientsCache) -> None:
+    """Same log-and-continue shape as `_run_scheduled_rules_poll`: a failed
+    poll keeps the last good `ClientsCache` contents rather than crashing the
+    app or clearing the cache — see `.claude/plans/phase6/plan.md`'s
+    "Settled design > Revocation".
+    """
+    try:
+        await load_clients_into_cache(cache)
+    except Exception:
+        logger.exception("Clients poll cycle failed; keeping last-known-good client cache")
+
+
+def start_scheduler(rules_cache: RulesCache, clients_cache: ClientsCache) -> None:
     """Registers the rules-poll job and starts the scheduler. `max_instances=1`
     so a slow poll cycle can't overlap the next scheduled run. `coalesce=True`
     because `load_rules_into_cache` is a full-replace, idempotent operation —
@@ -54,8 +68,21 @@ def start_scheduler(rules_cache: RulesCache) -> None:
         coalesce=True,
         replace_existing=True,
     )
+    _scheduler.add_job(
+        _run_scheduled_clients_poll,
+        trigger=IntervalTrigger(seconds=settings.get_clients_poll_interval_seconds()),
+        kwargs={"cache": clients_cache},
+        id="clients_poll",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
     _scheduler.start()
-    logger.info("Rules-poll scheduler started (interval=%ds)", settings.get_rules_poll_interval_seconds())
+    logger.info(
+        "Scheduler started (rules_poll interval=%ds, clients_poll interval=%ds)",
+        settings.get_rules_poll_interval_seconds(),
+        settings.get_clients_poll_interval_seconds(),
+    )
 
 
 async def shutdown_scheduler() -> None:

@@ -6,8 +6,13 @@ from fastapi import APIRouter, Depends
 from redis.asyncio import Redis
 
 from core.dependencies import get_redis
+from core.security.auth_dependency import require_scope
 
-router = APIRouter()
+# Not explicitly listed in the plan's endpoint table — treated as admin
+# plane: it exposes Redis internals (memory, connected clients, replication
+# role), diagnostic/operational like the rules/groups/clients API, not data
+# plane. See CLAUDE.md's Phase 6 deviations.
+router = APIRouter(dependencies=[Depends(require_scope("admin"))])
 
 
 @router.get("/redis/health")

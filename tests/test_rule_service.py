@@ -15,6 +15,7 @@ def _rule(**overrides) -> Rule:
     identifier_types = overrides.pop("identifier_types", None) or [overrides.pop("identifier_type", "user_id")]
     defaults = dict(
         id=uuid.uuid4(),
+        client_id=uuid.uuid4(),
         endpoint="/checkout",
         identifier_types=identifier_types,
         identifier_signature="+".join(sorted(identifier_types)),
@@ -30,8 +31,21 @@ def _rule(**overrides) -> Rule:
     return Rule(**defaults)
 
 
-def _service(rule_repo=None, algorithm_repo=None, group_repo=None) -> RuleService:
-    return RuleService(rule_repo or AsyncMock(), algorithm_repo or AsyncMock(), group_repo or AsyncMock())
+def _client_repo_with_client(client_id: str = "acme-corp") -> AsyncMock:
+    repo = AsyncMock()
+    client = AsyncMock()
+    client.id = uuid.uuid4()
+    repo.get_by_client_id.return_value = client
+    return repo
+
+
+def _service(rule_repo=None, algorithm_repo=None, group_repo=None, client_repo=None) -> RuleService:
+    return RuleService(
+        rule_repo or AsyncMock(),
+        algorithm_repo or AsyncMock(),
+        group_repo or AsyncMock(),
+        client_repo or _client_repo_with_client(),
+    )
 
 
 async def test_create_rejects_unknown_algorithm():
@@ -40,6 +54,7 @@ async def test_create_rejects_unknown_algorithm():
     service = _service(algorithm_repo=algorithm_repo)
 
     request = RuleCreateRequestDTO(
+        client_id="acme-corp",
         endpoint="/checkout",
         identifier_types=["user_id"],
         algorithm_id=uuid.uuid4(),
@@ -59,6 +74,7 @@ async def test_create_maps_db_race_to_scope_conflict():
     service = _service(rule_repo, algorithm_repo)
 
     request = RuleCreateRequestDTO(
+        client_id="acme-corp",
         endpoint="/checkout",
         identifier_types=["user_id"],
         algorithm_id=uuid.uuid4(),

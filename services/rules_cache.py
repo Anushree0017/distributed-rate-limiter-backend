@@ -13,15 +13,19 @@ logger = logging.getLogger(__name__)
 
 class RulesCache:
     """Holds the full set of rate-limiting rules in memory, keyed by rule id,
-    plus two indexes the rate limiter's resolution logic uses:
+    plus two indexes the rate limiter's resolution logic uses, both keyed by
+    `(client_pk, endpoint)` rather than bare `endpoint` (Phase 6: resolution
+    runs inside the authenticated client's namespace, so two clients can both
+    expose the same endpoint path without colliding):
 
-    - `_candidates_by_endpoint[endpoint]`: every active, non-`global` rule for
-      that endpoint, pre-sorted by `(-len(engine_identifier_types),
-      -priority, identifier_signature)` — so "first entry whose
-      `engine_identifier_types` is a subset of the request's provided types"
-      is the whole resolution scan (`get_candidates`).
-    - `_global_by_endpoint[endpoint]`: the active `global` rule for that
-      endpoint, if any (`get_global`).
+    - `_candidates_by_scope[(client_pk, endpoint)]`: every active, non-`global`
+      rule for that client+endpoint, pre-sorted by
+      `(-len(engine_identifier_types), -priority, identifier_signature)` — so
+      "first entry whose `engine_identifier_types` is a subset of the
+      request's provided types" is the whole resolution scan
+      (`get_candidates`).
+    - `_global_by_scope[(client_pk, endpoint)]`: the active `global` rule for
+      that client+endpoint, if any (`get_global`).
 
     A rule whose `engine_identifier_types` is `None` (see
     `services/rules_loader.py`'s `_serialize_rule` — no runtime mapping for
@@ -44,8 +48,8 @@ class RulesCache:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._rules_by_id: dict[str, dict] = {}
-        self._candidates_by_endpoint: dict[str, list[dict]] = {}
-        self._global_by_endpoint: dict[str, dict] = {}
+        self._candidates_by_scope: dict[tuple[str, str], list[dict]] = {}
+        self._global_by_scope: dict[tuple[str, str], dict] = {}
         self._ready = False
         self._last_loaded_at: datetime | None = None
         self._generation = 0
@@ -54,15 +58,16 @@ class RulesCache:
     def _sort_key(rule: dict) -> tuple[int, int, str]:
         return (-len(rule["engine_identifier_types"]), -rule["priority"], rule["identifier_signature"])
 
-    def _log_ambiguous_ties(self, candidates_by_endpoint: dict[str, list[dict]]) -> None:
-        """WARNING for each pair of rules at the same endpoint with equal
-        specificity (type-set size) and equal priority — resolution can't
-        deterministically prefer one over the other except by
+    def _log_ambiguous_ties(self, candidates_by_scope: dict[tuple[str, str], list[dict]]) -> None:
+        """WARNING for each pair of rules at the same client+endpoint with
+        equal specificity (type-set size) and equal priority — resolution
+        can't deterministically prefer one over the other except by
         `identifier_signature` string order, which is an implementation
-        detail an operator shouldn't rely on. Logs types, never values (there
-        are none to log here — rules carry no identifier values).
+        detail an operator shouldn't rely on. Logs `client_id` and types,
+        never identifier values (there are none to log here — rules carry no
+        identifier values).
         """
-        for endpoint, candidates in candidates_by_endpoint.items():
+        for (client_pk, endpoint), candidates in candidates_by_scope.items():
             for i in range(len(candidates) - 1):
                 a, b = candidates[i], candidates[i + 1]
                 if (
@@ -70,9 +75,10 @@ class RulesCache:
                     and a["priority"] == b["priority"]
                 ):
                     logger.warning(
-                        "Ambiguous rule tie at endpoint=%s: rule %s (types=%s) and rule %s (types=%s) "
-                        "have equal specificity and priority=%s; resolution order between them is "
-                        "arbitrary (broken only by identifier_signature string order)",
+                        "Ambiguous rule tie at client_id=%s endpoint=%s: rule %s (types=%s) and rule %s "
+                        "(types=%s) have equal specificity and priority=%s; resolution order between them "
+                        "is arbitrary (broken only by identifier_signature string order)",
+                        client_pk,
                         endpoint,
                         a["id"],
                         a["identifier_signature"],
@@ -91,23 +97,24 @@ class RulesCache:
             rule for rule in rules if rule["status"] == "active" and rule["engine_identifier_types"] is not None
         ]
 
-        global_by_endpoint: dict[str, dict] = {}
-        candidates_by_endpoint: dict[str, list[dict]] = {}
+        global_by_scope: dict[tuple[str, str], dict] = {}
+        candidates_by_scope: dict[tuple[str, str], list[dict]] = {}
         for rule in active_usable:
+            scope = (rule["client_pk"], rule["endpoint"])
             if rule["is_global"]:
-                global_by_endpoint[rule["endpoint"]] = rule
+                global_by_scope[scope] = rule
             else:
-                candidates_by_endpoint.setdefault(rule["endpoint"], []).append(rule)
+                candidates_by_scope.setdefault(scope, []).append(rule)
 
-        for endpoint, candidates in candidates_by_endpoint.items():
+        for scope, candidates in candidates_by_scope.items():
             candidates.sort(key=self._sort_key)
 
-        self._log_ambiguous_ties(candidates_by_endpoint)
+        self._log_ambiguous_ties(candidates_by_scope)
 
         with self._lock:
             self._rules_by_id = by_id
-            self._candidates_by_endpoint = candidates_by_endpoint
-            self._global_by_endpoint = global_by_endpoint
+            self._candidates_by_scope = candidates_by_scope
+            self._global_by_scope = global_by_scope
             self._ready = True
             self._last_loaded_at = datetime.now(timezone.utc)
             self._generation += 1
@@ -132,13 +139,15 @@ class RulesCache:
     def get(self, rule_id: str) -> dict | None:
         return self._rules_by_id.get(rule_id)
 
-    def get_candidates(self, endpoint: str) -> list[dict]:
-        """Active, non-`global`, usable rules for `endpoint`, pre-sorted
-        most-specific-first. Empty list if none."""
-        return self._candidates_by_endpoint.get(endpoint, [])
+    def get_candidates(self, client_pk: str, endpoint: str) -> list[dict]:
+        """Active, non-`global`, usable rules for `(client_pk, endpoint)`,
+        pre-sorted most-specific-first. Empty list if none — including when
+        `endpoint` only has rules under a *different* client, which is the
+        whole point (client isolation)."""
+        return self._candidates_by_scope.get((client_pk, endpoint), [])
 
-    def get_global(self, endpoint: str) -> dict | None:
-        return self._global_by_endpoint.get(endpoint)
+    def get_global(self, client_pk: str, endpoint: str) -> dict | None:
+        return self._global_by_scope.get((client_pk, endpoint))
 
     def get_generation(self) -> int:
         """Increments on every `load_all` — callers that want to reset a
