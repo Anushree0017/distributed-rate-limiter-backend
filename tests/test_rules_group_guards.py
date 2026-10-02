@@ -11,7 +11,9 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from core.settings import settings
 from main import app
-from tests.conftest import get_test_database_url, get_test_redis_url
+from tests.conftest import admin_auth_headers, get_test_database_url, get_test_redis_url
+
+_HEADERS = admin_auth_headers()
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -37,6 +39,7 @@ def _grouped_rule(client: TestClient) -> dict:
     group = client.post(
         "/api/v1/groups",
         json={
+            "client_id": "default",
             "name": "grp-guard-test",
             "algorithm_id": algorithm_id,
             "identifier_types": ["api_key"],
@@ -50,9 +53,11 @@ def _grouped_rule(client: TestClient) -> dict:
 
 def test_post_rules_rejects_group_id_field():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         response = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/x",
                 "identifier_types": ["global"],
                 "algorithm_id": _algorithm_id(client),
@@ -65,9 +70,11 @@ def test_post_rules_rejects_group_id_field():
 
 def test_post_rules_rejects_overrides_field():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         response = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/x",
                 "identifier_types": ["global"],
                 "algorithm_id": _algorithm_id(client),
@@ -80,6 +87,7 @@ def test_post_rules_rejects_overrides_field():
 
 def test_patch_params_on_grouped_rule_is_rejected():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         member = _grouped_rule(client)
         response = client.patch(
             f"/api/v1/rules/{member['rule_id']}",
@@ -91,6 +99,7 @@ def test_patch_params_on_grouped_rule_is_rejected():
 
 def test_patch_priority_on_grouped_rule_is_rejected():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         member = _grouped_rule(client)
         response = client.patch(
             f"/api/v1/rules/{member['rule_id']}",
@@ -102,9 +111,11 @@ def test_patch_priority_on_grouped_rule_is_rejected():
 
 def test_patch_overrides_on_standalone_rule_is_rejected():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         rule = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/standalone",
                 "identifier_types": ["global"],
                 "algorithm_id": _algorithm_id(client),
@@ -122,6 +133,7 @@ def test_patch_overrides_on_standalone_rule_is_rejected():
 
 def test_patch_overrides_on_grouped_rule_recomputes_params():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         member = _grouped_rule(client)
         response = client.patch(
             f"/api/v1/rules/{member['rule_id']}",
@@ -135,6 +147,7 @@ def test_patch_overrides_on_grouped_rule_recomputes_params():
 
 def test_patch_status_on_grouped_rule_still_allowed():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         member = _grouped_rule(client)
         response = client.patch(
             f"/api/v1/rules/{member['rule_id']}",
@@ -146,6 +159,7 @@ def test_patch_status_on_grouped_rule_still_allowed():
 
 def test_delete_member_rule_leaves_group_intact():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         member = _grouped_rule(client)
         group_id = client.get(f"/api/v1/rules/{member['rule_id']}").json()["group_id"]
 
@@ -159,9 +173,11 @@ def test_delete_member_rule_leaves_group_intact():
 
 def test_detach_standalone_rule_is_rejected():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         rule = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/standalone2",
                 "identifier_types": ["global"],
                 "algorithm_id": _algorithm_id(client),
@@ -179,6 +195,7 @@ def test_detach_standalone_rule_is_rejected():
 
 def test_detach_with_unknown_algorithm_name_is_rejected():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         member = _grouped_rule(client)
         response = client.patch(
             f"/api/v1/rules/{member['rule_id']}/detach",
@@ -190,6 +207,7 @@ def test_detach_with_unknown_algorithm_name_is_rejected():
 
 def test_detach_with_invalid_params_for_chosen_algorithm_is_rejected_and_writes_nothing():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         member = _grouped_rule(client)
         response = client.patch(
             f"/api/v1/rules/{member['rule_id']}/detach",
@@ -205,10 +223,12 @@ def test_detach_with_invalid_params_for_chosen_algorithm_is_rejected_and_writes_
 
 def test_move_to_group_rejects_invalid_override_key():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         algorithm_id = _algorithm_id(client)
         rule = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/to-move",
                 "identifier_types": ["global"],
                 "algorithm_id": algorithm_id,
@@ -219,6 +239,7 @@ def test_move_to_group_rejects_invalid_override_key():
         group = client.post(
             "/api/v1/groups",
             json={
+                "client_id": "default",
                 "name": "grp-move-bad-override",
                 "algorithm_id": algorithm_id,
                 "identifier_types": ["global"],

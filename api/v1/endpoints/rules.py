@@ -6,14 +6,22 @@ import uuid
 from fastapi import APIRouter, Depends, Query, status
 
 from core.dependencies import get_rule_group_service, get_rule_service
-from dto.rule_dto import RuleCreateRequestDTO, RuleFilter, RuleListResponse, RuleResponseDTO, RuleUpdateRequestDTO
+from core.security.auth_dependency import require_scope
+from dto.rule_dto import (
+    RuleCreateRequestDTO,
+    RuleFilter,
+    RuleListResponse,
+    RuleResponseDTO,
+    RuleUpdateRequestDTO,
+    build_rule_response,
+)
 from dto.rule_group_dto import DetachRuleRequestDTO, MoveToGroupRequestDTO
 from model.rule_identifier_type import RuleIdentifierType
 from model.rule_status import RuleStatus
 from services.rule_group_service import RuleGroupService
 from services.rule_service import RuleService
 
-router = APIRouter(prefix="/rules")
+router = APIRouter(prefix="/rules", dependencies=[Depends(require_scope("admin"))])
 
 
 @router.get("/identifiers")
@@ -23,6 +31,7 @@ async def list_identifier_types() -> dict:
 
 @router.get("", response_model=RuleListResponse)
 async def list_rules(
+    client_id: str | None = Query(default=None),
     endpoint: str | None = Query(default=None),
     identifier_type: RuleIdentifierType | None = Query(default=None),
     identifier_signature: str | None = Query(default=None),
@@ -32,7 +41,9 @@ async def list_rules(
     page_size: int = Query(default=20, ge=1, le=100),
     service: RuleService = Depends(get_rule_service),
 ) -> RuleListResponse:
+    client_pk = await service.resolve_client_pk(client_id) if client_id is not None else None
     filters = RuleFilter(
+        client_pk=client_pk,
         endpoint=endpoint,
         identifier_type=identifier_type,
         identifier_signature=identifier_signature,
@@ -43,7 +54,7 @@ async def list_rules(
     )
     items, total = await service.list_rules(filters)
     return RuleListResponse(
-        items=[RuleResponseDTO.model_validate(rule) for rule in items],
+        items=[build_rule_response(rule) for rule in items],
         page=page,
         page_size=page_size,
         total=total,
@@ -53,7 +64,7 @@ async def list_rules(
 @router.get("/{rule_id}", response_model=RuleResponseDTO)
 async def get_rule(rule_id: uuid.UUID, service: RuleService = Depends(get_rule_service)) -> RuleResponseDTO:
     rule = await service.get_rule(rule_id)
-    return RuleResponseDTO.model_validate(rule)
+    return build_rule_response(rule)
 
 
 @router.post("", response_model=RuleResponseDTO, status_code=status.HTTP_201_CREATED)
@@ -61,7 +72,7 @@ async def create_rule(
     payload: RuleCreateRequestDTO, service: RuleService = Depends(get_rule_service)
 ) -> RuleResponseDTO:
     rule = await service.create_rule(payload)
-    return RuleResponseDTO.model_validate(rule)
+    return build_rule_response(rule)
 
 
 @router.patch("/{rule_id}", response_model=RuleResponseDTO)
@@ -69,7 +80,7 @@ async def update_rule(
     rule_id: uuid.UUID, payload: RuleUpdateRequestDTO, service: RuleService = Depends(get_rule_service)
 ) -> RuleResponseDTO:
     rule = await service.update_rule(rule_id, payload)
-    return RuleResponseDTO.model_validate(rule)
+    return build_rule_response(rule)
 
 
 @router.delete("/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -84,7 +95,7 @@ async def detach_rule(
     service: RuleGroupService = Depends(get_rule_group_service),
 ) -> RuleResponseDTO:
     rule = await service.detach_rule(rule_id, payload)
-    return RuleResponseDTO.model_validate(rule)
+    return build_rule_response(rule)
 
 
 @router.post("/{rule_id}/move-to-group", response_model=RuleResponseDTO)
@@ -94,4 +105,4 @@ async def move_rule_to_group(
     service: RuleGroupService = Depends(get_rule_group_service),
 ) -> RuleResponseDTO:
     rule = await service.move_to_group(rule_id, payload)
-    return RuleResponseDTO.model_validate(rule)
+    return build_rule_response(rule)

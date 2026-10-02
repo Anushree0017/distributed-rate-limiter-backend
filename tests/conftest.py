@@ -173,6 +173,54 @@ async def _fresh_db_engine_per_test():
     core.db._session_factory = None
 
 
+# ---------------------------------------------------------------------------
+# Phase 6 (service auth) test helpers.
+#
+# `default` (seeded by migration 0012) already has scopes=["check"], so it
+# doubles as the `check`-scope test client — no second client needed for
+# that. A dedicated `test-admin-client` is seeded once per session for
+# `admin`-scope tests. Tokens are minted directly via `TokenService`, not
+# through `POST /auth/token` — these are the *protected-endpoint* tests, not
+# the token-endpoint's own tests (see test_auth_api.py for those), so there's
+# no reason to also exercise the full client-credentials exchange here.
+# ---------------------------------------------------------------------------
+from core.security.tokens import TokenService
+
+TEST_ADMIN_CLIENT_ID = "test-admin-client"
+TEST_CHECK_CLIENT_ID = "default"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _seed_admin_test_client(_run_migrations):
+    import asyncio
+
+    async def _seed():
+        from model.client import Client
+
+        engine = create_async_engine(get_test_database_url())
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session:
+            existing = await session.execute(
+                text("SELECT 1 FROM clients WHERE client_id = :cid"), {"cid": TEST_ADMIN_CLIENT_ID}
+            )
+            if existing.scalar_one_or_none() is None:
+                session.add(Client(client_id=TEST_ADMIN_CLIENT_ID, name="Test Admin Client", scopes=["admin"]))
+                await session.commit()
+        await engine.dispose()
+
+    asyncio.run(_seed())
+
+
+def admin_auth_headers() -> dict:
+    token, _ = TokenService().issue(TEST_ADMIN_CLIENT_ID, ["admin"])
+    return {"Authorization": f"Bearer {token}"}
+
+
+def check_auth_headers(client_id: str = TEST_CHECK_CLIENT_ID) -> dict:
+    token, _ = TokenService().issue(client_id, ["check"])
+    return {"Authorization": f"Bearer {token}"}
+
+
 @pytest_asyncio.fixture
 async def db_session():
     engine = create_async_engine(get_test_database_url())
@@ -183,5 +231,16 @@ async def db_session():
         finally:
             await session.rollback()
             await session.execute(text("TRUNCATE rule_groups, rule_history, rules RESTART IDENTITY CASCADE"))
+            # client_secrets/clients aren't truncated wholesale (that would
+            # also delete the seeded `default` client, and the session-scoped
+            # `test-admin-client` that `admin_auth_headers()` mints tokens
+            # against, both of which other fixtures/tests rely on surviving
+            # past this one test) — just remove whatever a test created,
+            # keeping those two.
+            await session.execute(text("DELETE FROM client_secrets"))
+            await session.execute(
+                text("DELETE FROM clients WHERE client_id NOT IN ('default', :admin_client_id)"),
+                {"admin_client_id": TEST_ADMIN_CLIENT_ID},
+            )
             await session.commit()
     await engine.dispose()

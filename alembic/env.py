@@ -13,7 +13,10 @@ from core.settings import settings
 # autogenerate — mirrors the FK order noted in
 # `.claude/plans/phase3/plan.md` (algorithms -> rules -> rule_history).
 import model.algorithm  # noqa: F401
+import model.client  # noqa: F401
+import model.client_secret  # noqa: F401
 import model.rule  # noqa: F401
+import model.rule_group  # noqa: F401
 import model.rule_history  # noqa: F401
 
 # this is the Alembic Config object, which provides

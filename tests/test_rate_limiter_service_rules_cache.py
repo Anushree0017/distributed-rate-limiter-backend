@@ -27,6 +27,7 @@ def _rule(identifier_types: list[str], **overrides) -> dict:
     engine_types = frozenset(RULE_TO_ENGINE_IDENTIFIER_TYPE[t] for t in identifier_types)
     defaults = dict(
         id="rule-1",
+        client_pk="cp-1",
         endpoint="/checkout",
         identifier_types=sorted(identifier_types),
         identifier_signature="+".join(sorted(identifier_types)),
@@ -61,8 +62,8 @@ async def test_a_db_rule_overrides_the_static_yaml_config_for_the_same_endpoint(
     # The DB rule's limit is 1 (far stricter than the YAML config's 100), so
     # a second request from the same client is denied if (and only if) the
     # cache-sourced rule is actually the one being enforced.
-    first = await service.check_rate_limit(_check("/checkout", "client_id", "client-1"))
-    second = await service.check_rate_limit(_check("/checkout", "client_id", "client-1"))
+    first = await service.check_rate_limit("cp-1", _check("/checkout", "client_id", "client-1"))
+    second = await service.check_rate_limit("cp-1", _check("/checkout", "client_id", "client-1"))
     assert first.allowed is True
     assert second.allowed is False
 
@@ -75,8 +76,8 @@ async def test_a_different_identifier_type_on_the_same_endpoint_resolves_indepen
     # A request declaring identifier_type="api_key" has no matching DB rule
     # and no global rule for this endpoint -> falls back to the static YAML
     # config (limit 100), so it is not denied on request 2.
-    await service.check_rate_limit(_check("/checkout", "api_key", "premium-key-1"))
-    second = await service.check_rate_limit(_check("/checkout", "api_key", "premium-key-1"))
+    await service.check_rate_limit("cp-1", _check("/checkout", "api_key", "premium-key-1"))
+    second = await service.check_rate_limit("cp-1", _check("/checkout", "api_key", "premium-key-1"))
     assert second.allowed is True
 
 
@@ -86,8 +87,8 @@ async def test_a_global_rule_applies_when_no_exact_type_rule_matches(redis_clien
     cache.load_all([global_rule])
     service = _service(redis_client, cache)
 
-    first = await service.check_rate_limit(_check("/checkout", "client_id", "anyone"))
-    second = await service.check_rate_limit(_check("/checkout", "client_id", "anyone"))
+    first = await service.check_rate_limit("cp-1", _check("/checkout", "client_id", "anyone"))
+    second = await service.check_rate_limit("cp-1", _check("/checkout", "client_id", "anyone"))
     assert first.allowed is True
     assert second.allowed is False
 
@@ -97,7 +98,7 @@ async def test_falls_back_to_static_config_when_no_rule_at_all_matches(redis_cli
     cache.load_all([])  # nothing loaded, but ready
     service = _service(redis_client, cache)
 
-    result = await service.check_rate_limit(_check("/checkout", "client_id", "client-1"))
+    result = await service.check_rate_limit("cp-1", _check("/checkout", "client_id", "client-1"))
     assert result.allowed is True
 
 
@@ -107,14 +108,14 @@ async def test_unusable_rule_falls_back_instead_of_raising(redis_client):
     cache.load_all([bad_rule])
     service = _service(redis_client, cache)
 
-    result = await service.check_rate_limit(_check("/checkout", "client_id", "client-1"))
+    result = await service.check_rate_limit("cp-1", _check("/checkout", "client_id", "client-1"))
     assert result.allowed is True
 
 
 async def test_no_rules_cache_behaves_exactly_like_before_this_feature(redis_client):
     service = _service(redis_client, None)
 
-    result = await service.check_rate_limit(_check("/checkout", "client_id", "client-1"))
+    result = await service.check_rate_limit("cp-1", _check("/checkout", "client_id", "client-1"))
     assert result.allowed is True
 
 
@@ -145,8 +146,8 @@ async def test_composite_rule_beats_single_type_rule_when_both_types_provided(re
             IdentifierValueDTO(type=IdentifierType.IP_ADDRESS, value="203.0.113.9"),
         ],
     )
-    first = await service.check_rate_limit(payload)
-    second = await service.check_rate_limit(payload)
+    first = await service.check_rate_limit("cp-1", payload)
+    second = await service.check_rate_limit("cp-1", payload)
     assert first.allowed is True
     assert second.allowed is False, "the stricter composite rule (limit=1) should have matched, not the single-type one"
 
@@ -161,7 +162,7 @@ async def test_missing_component_falls_back_to_single_type_rule(redis_client):
     cache.load_all([single, composite])
     service = _service(redis_client, cache)
 
-    result = await service.check_rate_limit(_check("/checkout", "api_key", "premium-partner-2"))
+    result = await service.check_rate_limit("cp-1", _check("/checkout", "api_key", "premium-partner-2"))
     assert result.allowed is True
     assert result.limit == 100, "should have matched the single-type {api_key} rule, not the composite one"
 
@@ -176,7 +177,7 @@ async def test_key_for_matched_rule_is_identical_regardless_of_extra_provided_id
     cache.load_all([single])
     service = _service(redis_client, cache)
 
-    await service.check_rate_limit(_check("/checkout", "api_key", "shared-key"))
+    await service.check_rate_limit("cp-1", _check("/checkout", "api_key", "shared-key"))
     payload_with_ip = RateLimitCheckRequestDTO(
         endpoint="/checkout",
         identifiers=[
@@ -184,5 +185,5 @@ async def test_key_for_matched_rule_is_identical_regardless_of_extra_provided_id
             IdentifierValueDTO(type=IdentifierType.IP_ADDRESS, value="203.0.113.10"),
         ],
     )
-    second = await service.check_rate_limit(payload_with_ip)
+    second = await service.check_rate_limit("cp-1", payload_with_ip)
     assert second.allowed is False, "same api_key bucket should already be exhausted regardless of the extra ip"

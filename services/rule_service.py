@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 
 from core.exceptions import (
     AlgorithmNotFoundError,
+    ClientNotFoundError,
     InvalidRuleParamsError,
     OverridesRequireGroupError,
     RuleManagedByGroupError,
@@ -20,6 +21,7 @@ from dto.rule_dto import RuleCreateRequestDTO, RuleFilter, RuleUpdateRequestDTO
 from model.rule import Rule
 from model.rule_status import RuleStatus
 from repositories.algorithm_repository import AlgorithmRepository
+from repositories.client_repository import ClientRepository
 from repositories.rule_group_repository import RuleGroupRepository
 from repositories.rule_repository import RuleRepository
 from services.group_params import validate_overrides_or_raise
@@ -32,10 +34,24 @@ class RuleService:
         repository: RuleRepository,
         algorithm_repository: AlgorithmRepository,
         group_repository: RuleGroupRepository,
+        client_repository: ClientRepository,
     ):
         self._repository = repository
         self._algorithm_repository = algorithm_repository
         self._group_repository = group_repository
+        self._client_repository = client_repository
+
+    async def _resolve_client_or_raise(self, client_id: str):
+        client = await self._client_repository.get_by_client_id(client_id)
+        if client is None:
+            raise ClientNotFoundError(client_id)
+        return client
+
+    async def resolve_client_pk(self, client_id: str):
+        """Public so the controller can translate a `?client_id=<slug>` query
+        filter into the internal PK `RuleFilter.client_pk` expects, without
+        the controller touching `ClientRepository` directly."""
+        return (await self._resolve_client_or_raise(client_id)).id
 
     async def _validate_params_or_raise(self, algorithm_id: uuid.UUID, params: dict) -> None:
         algorithm = await self._algorithm_repository.get_by_id(algorithm_id)
@@ -47,10 +63,12 @@ class RuleService:
             raise InvalidRuleParamsError(algorithm.name, str(exc))
 
     async def create_rule(self, data: RuleCreateRequestDTO) -> Rule:
+        client = await self._resolve_client_or_raise(data.client_id)
         await self._validate_params_or_raise(data.algorithm_id, data.params)
         identifier_types, identifier_signature = data.normalized_identifier_types()
 
         rule = Rule(
+            client_id=client.id,
             endpoint=data.endpoint,
             identifier_types=identifier_types,
             identifier_signature=identifier_signature,
@@ -115,7 +133,7 @@ class RuleService:
 
         if new_status == RuleStatus.ACTIVE.value:
             conflict = await self._repository.find_active_conflict(
-                rule.endpoint, rule.identifier_signature, exclude_id=rule.id
+                rule.client_id, rule.endpoint, rule.identifier_signature, exclude_id=rule.id
             )
             if conflict is not None:
                 raise ScopeConflictError(rule.endpoint, rule.identifier_signature)

@@ -2,7 +2,7 @@ from fastapi.testclient import TestClient
 
 from core.settings import settings
 from main import app
-from tests.conftest import get_test_redis_url
+from tests.conftest import admin_auth_headers, get_test_redis_url
 
 _EXPECTED_FIELDS = {
     "used_memory",
@@ -19,7 +19,7 @@ def test_redis_health_returns_diagnostic_fields(monkeypatch):
     monkeypatch.setenv("REDIS_URL", get_test_redis_url())
     settings.reload()
     with TestClient(app) as client:
-        response = client.get("/api/v1/redis/health")
+        response = client.get("/api/v1/redis/health", headers=admin_auth_headers())
 
     assert response.status_code == 200
     body = response.json()

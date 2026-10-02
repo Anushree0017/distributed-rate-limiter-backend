@@ -42,6 +42,7 @@ def _serialize_rule(rule: Rule) -> dict:
 
     return {
         "id": str(rule.id),
+        "client_pk": str(rule.client_id),
         "endpoint": rule.endpoint,
         "identifier_types": list(rule.identifier_types),
         "identifier_signature": rule.identifier_signature,

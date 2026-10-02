@@ -28,6 +28,10 @@ class RuleCreateRequestDTO(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # Phase 6: the owning client's public slug — resolved to its internal PK
+    # server-side (`services/rule_service.py`); responses echo this same slug
+    # back, never the PK.
+    client_id: str
     endpoint: str
     identifier_types: list[RuleIdentifierType]
     algorithm_id: uuid.UUID
@@ -63,6 +67,7 @@ class RuleResponseDTO(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
+    client_id: str
     endpoint: str
     identifier_types: list[str]
     identifier_signature: str
@@ -77,6 +82,20 @@ class RuleResponseDTO(BaseModel):
     updated_by: str | None
     created_at: datetime
     updated_at: datetime
+
+
+def build_rule_response(rule) -> RuleResponseDTO:
+    """`Rule.client_id` the ORM column is the internal FK/PK (a UUID), not
+    the public slug the admin API deals in. A plain `model_validate(rule)`
+    would feed that UUID straight into the DTO's `client_id: str` field —
+    Pydantic v2 doesn't coerce UUID -> str even in lax mode, so that raises a
+    `ValidationError` outright, rather than quietly stringifying the wrong
+    value. Build the dict explicitly instead, substituting the eager-loaded
+    `rule.client.client_id` (the slug) for the raw column.
+    """
+    data = {field: getattr(rule, field) for field in RuleResponseDTO.model_fields if field != "client_id"}
+    data["client_id"] = rule.client.client_id
+    return RuleResponseDTO.model_validate(data)
 
 
 class RuleListResponse(BaseModel):
@@ -95,6 +114,7 @@ class RuleFilter(BaseModel):
     composite-aware filter.
     """
 
+    client_pk: uuid.UUID | None = None
     endpoint: str | None = None
     identifier_type: RuleIdentifierType | None = None
     identifier_signature: str | None = None

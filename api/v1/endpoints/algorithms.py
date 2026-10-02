@@ -4,10 +4,11 @@
 from fastapi import APIRouter, Depends
 
 from core.dependencies import get_algorithm_service
+from core.security.auth_dependency import require_scope
 from dto.algorithm_dto import AlgorithmResponse
 from services.algorithm_service import AlgorithmService
 
-router = APIRouter(prefix="/algorithms")
+router = APIRouter(prefix="/algorithms", dependencies=[Depends(require_scope("admin"))])
 
 
 @router.get("", response_model=list[AlgorithmResponse])

@@ -57,6 +57,19 @@ class ScopeConflictError(Exception):
         )
 
 
+class CrossClientOperationError(Exception):
+    """Phase 6: a rule and the group it's being moved into/added to belong to
+    different clients. The group invariant ("a rule's client_id equals its
+    group's client_id") makes this illegal regardless of any other state —
+    see `.claude/plans/phase6/plan.md`'s Step 9.
+    """
+
+    def __init__(self, rule_id, group_id):
+        self.rule_id = rule_id
+        self.group_id = group_id
+        super().__init__(f"Rule {rule_id} and group {group_id} belong to different clients")
+
+
 class RuleGroupNotFoundError(Exception):
     def __init__(self, group_id):
         self.group_id = group_id
@@ -142,6 +155,95 @@ class InvalidRuleParamsError(Exception):
         super().__init__(f"params are invalid for algorithm {algorithm_name!r}: {reason}")
 
 
+class ClientNotFoundError(Exception):
+    def __init__(self, client_id):
+        self.client_id = client_id
+        super().__init__(f"Client {client_id!r} not found")
+
+
+class ClientIdConflictError(Exception):
+    def __init__(self, client_id: str):
+        self.client_id = client_id
+        super().__init__(f"A client with client_id {client_id!r} already exists")
+
+
+class TooManyActiveSecretsError(Exception):
+    """At most two active secrets per client, so rotation has no downtime —
+    a third requires revoking one first."""
+
+    def __init__(self, client_id: str):
+        self.client_id = client_id
+        super().__init__(f"Client {client_id!r} already has two active secrets; revoke one before adding another")
+
+
+class LastActiveSecretError(Exception):
+    """Refuses to revoke a client's only remaining active secret unless the
+    client is itself disabled (which already blocks new token issuance)."""
+
+    def __init__(self, client_id: str):
+        self.client_id = client_id
+        super().__init__(f"Cannot revoke the last active secret of client {client_id!r} while it is active")
+
+
+class ClientSecretNotFoundError(Exception):
+    def __init__(self, secret_id):
+        self.secret_id = secret_id
+        super().__init__(f"Client secret {secret_id} not found")
+
+
+class InvalidRequestError(Exception):
+    """RFC 6749 `invalid_request` — the token request itself is malformed
+    (missing `grant_type`, unsupported `grant_type`, no credentials
+    supplied by either form fields or HTTP Basic).
+    """
+
+    def __init__(self, description: str):
+        self.description = description
+        super().__init__(description)
+
+
+class InvalidClientError(Exception):
+    """RFC 6749 `invalid_client` — deliberately the *same* exception for
+    unknown client, wrong secret, expired/revoked secret, and a disabled
+    client (see `services/auth_service.py`), so none of those cases is
+    distinguishable from the outside.
+    """
+
+
+class InvalidScopeError(Exception):
+    """RFC 6749 `invalid_scope` — a requested scope isn't a subset of the
+    client's registered scopes.
+    """
+
+    def __init__(self, unknown_scopes: list[str]):
+        self.unknown_scopes = unknown_scopes
+        super().__init__(f"Requested scope(s) not granted to this client: {unknown_scopes}")
+
+
+class AuthenticationError(Exception):
+    """No bearer token, a malformed one, or one that fails verification
+    (expired, wrong signature, unknown kid, ...) — 401, per
+    `.claude/plans/phase6/plan.md`'s endpoint/scope table. Never echoes the
+    token or the underlying `TokenError` reason to the caller.
+    """
+
+
+class AuthorizationError(Exception):
+    """A verified, valid token whose client lacks the required scope, or
+    whose client is disabled per `ClientsCache` — 403, distinct from
+    `AuthenticationError`'s 401 (the token itself is fine; the caller just
+    isn't allowed to do this).
+    """
+
+
+def _oauth_error_response(status_code: int, error: str, description: str) -> JSONResponse:
+    """RFC 6749 §5.2 error shape — distinct from this service's own
+    `{"error": {"code", "message", "details"}}` envelope, since the token
+    endpoint's error contract is the OAuth2 spec's, not ours.
+    """
+    return JSONResponse(status_code=status_code, content={"error": error, "error_description": description})
+
+
 def _error_response(status_code: int, code: str, message: str, details: dict | None = None) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
@@ -193,6 +295,12 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def _invalid_rule_params(request: Request, exc: InvalidRuleParamsError) -> JSONResponse:
         return _error_response(
             422, "INVALID_RULE_PARAMS", str(exc), {"algorithm_name": exc.algorithm_name}
+        )
+
+    @app.exception_handler(CrossClientOperationError)
+    async def _cross_client_operation(request: Request, exc: CrossClientOperationError) -> JSONResponse:
+        return _error_response(
+            409, "CROSS_CLIENT_OPERATION", str(exc), {"rule_id": str(exc.rule_id), "group_id": str(exc.group_id)}
         )
 
     @app.exception_handler(RuleGroupNotFoundError)
@@ -261,6 +369,54 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(ScriptRegistrationError)
     async def _script_registration_failed(request: Request, exc: ScriptRegistrationError) -> JSONResponse:
         return _error_response(503, "SCRIPT_REGISTRATION_FAILED", str(exc))
+
+    @app.exception_handler(ClientNotFoundError)
+    async def _client_not_found(request: Request, exc: ClientNotFoundError) -> JSONResponse:
+        return _error_response(404, "CLIENT_NOT_FOUND", str(exc), {"client_id": str(exc.client_id)})
+
+    @app.exception_handler(ClientIdConflictError)
+    async def _client_id_conflict(request: Request, exc: ClientIdConflictError) -> JSONResponse:
+        return _error_response(409, "CLIENT_ID_CONFLICT", str(exc), {"client_id": exc.client_id})
+
+    @app.exception_handler(TooManyActiveSecretsError)
+    async def _too_many_active_secrets(request: Request, exc: TooManyActiveSecretsError) -> JSONResponse:
+        return _error_response(409, "TOO_MANY_ACTIVE_SECRETS", str(exc), {"client_id": exc.client_id})
+
+    @app.exception_handler(LastActiveSecretError)
+    async def _last_active_secret(request: Request, exc: LastActiveSecretError) -> JSONResponse:
+        return _error_response(409, "LAST_ACTIVE_SECRET", str(exc), {"client_id": exc.client_id})
+
+    @app.exception_handler(ClientSecretNotFoundError)
+    async def _client_secret_not_found(request: Request, exc: ClientSecretNotFoundError) -> JSONResponse:
+        return _error_response(404, "CLIENT_SECRET_NOT_FOUND", str(exc), {"secret_id": str(exc.secret_id)})
+
+    @app.exception_handler(InvalidRequestError)
+    async def _invalid_request(request: Request, exc: InvalidRequestError) -> JSONResponse:
+        return _oauth_error_response(400, "invalid_request", exc.description)
+
+    @app.exception_handler(InvalidClientError)
+    async def _invalid_client(request: Request, exc: InvalidClientError) -> JSONResponse:
+        return JSONResponse(
+            status_code=401,
+            content={"error": "invalid_client", "error_description": "Client authentication failed"},
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    @app.exception_handler(InvalidScopeError)
+    async def _invalid_scope(request: Request, exc: InvalidScopeError) -> JSONResponse:
+        return _oauth_error_response(400, "invalid_scope", f"Scope(s) not granted to this client: {exc.unknown_scopes}")
+
+    @app.exception_handler(AuthenticationError)
+    async def _authentication_error(request: Request, exc: AuthenticationError) -> JSONResponse:
+        return JSONResponse(
+            status_code=401,
+            content={"error": {"code": "UNAUTHORIZED", "message": "Missing or invalid bearer token", "details": {}}},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    @app.exception_handler(AuthorizationError)
+    async def _authorization_error(request: Request, exc: AuthorizationError) -> JSONResponse:
+        return _error_response(403, "FORBIDDEN", "Insufficient scope, or the client is disabled")
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:

@@ -10,7 +10,9 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from core.settings import settings
 from main import app
-from tests.conftest import get_test_database_url, get_test_redis_url
+from tests.conftest import admin_auth_headers, check_auth_headers, get_test_database_url, get_test_redis_url
+
+_HEADERS = admin_auth_headers()
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -33,6 +35,7 @@ def _algorithm_id(client: TestClient, name: str = "FixedWindow") -> str:
 
 def _create_group(client: TestClient, **overrides) -> dict:
     body = {
+        "client_id": "default",
         "name": "grp-checkout",
         "algorithm_id": _algorithm_id(client),
         "identifier_types": ["api_key"],
@@ -47,6 +50,7 @@ def _create_group(client: TestClient, **overrides) -> dict:
 
 def test_create_group_with_members_and_one_override_computes_effective_params():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         group = _create_group(
             client,
             members=[
@@ -67,6 +71,7 @@ def test_create_group_with_members_and_one_override_computes_effective_params():
 
 def test_patch_base_propagates_to_inheriting_members_but_not_overridden_one():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         group = _create_group(
             client,
             members=[{"endpoint": "/a"}, {"endpoint": "/d", "overrides": {"limit": 300}}],
@@ -91,10 +96,12 @@ def test_patch_base_propagates_to_inheriting_members_but_not_overridden_one():
 
 def test_group_name_uniqueness_is_case_insensitive():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         _create_group(client, name="grp-unique")
         response = client.post(
             "/api/v1/groups",
             json={
+                "client_id": "default",
                 "name": "GRP-UNIQUE",
                 "algorithm_id": _algorithm_id(client),
                 "identifier_types": ["api_key"],
@@ -108,9 +115,11 @@ def test_group_name_uniqueness_is_case_insensitive():
 
 def test_member_override_with_unknown_key_is_rejected_and_writes_nothing():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         response = client.post(
             "/api/v1/groups",
             json={
+                "client_id": "default",
                 "name": "grp-bad-override",
                 "algorithm_id": _algorithm_id(client),
                 "identifier_types": ["api_key"],
@@ -126,6 +135,7 @@ def test_member_override_with_unknown_key_is_rejected_and_writes_nothing():
 
 def test_patch_group_cannot_change_algorithm_or_identifier_types():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         group = _create_group(client)
         response = client.patch(
             f"/api/v1/groups/{group['id']}",
@@ -141,6 +151,7 @@ def test_patch_group_cannot_change_algorithm_or_identifier_types():
 
 def test_add_members_appends_without_touching_existing_members():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         group = _create_group(client, members=[{"endpoint": "/a"}, {"endpoint": "/b"}])
         response = client.post(
             f"/api/v1/groups/{group['id']}/members",
@@ -160,11 +171,13 @@ def test_add_members_appends_without_touching_existing_members():
 
 def test_add_members_conflict_reports_all_and_writes_nothing():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         algorithm_id = _algorithm_id(client)
         # A standalone rule that will conflict with the group's identifier scope.
         client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/taken",
                 "identifier_types": ["api_key"],
                 "algorithm_id": algorithm_id,
@@ -191,6 +204,7 @@ def test_add_members_conflict_reports_all_and_writes_nothing():
 
 def test_add_members_rejects_invalid_override_key_and_writes_nothing():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         group = _create_group(client, members=[{"endpoint": "/a"}])
         response = client.post(
             f"/api/v1/groups/{group['id']}/members",
@@ -205,6 +219,7 @@ def test_add_members_rejects_invalid_override_key_and_writes_nothing():
 
 def test_detach_member_leaves_group_intact_and_rule_becomes_standalone():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         algorithm_id = _algorithm_id(client, "TokenBucket")
         group = _create_group(client, members=[{"endpoint": "/a"}, {"endpoint": "/b"}])
         rule_id = next(m["rule_id"] for m in client.get(f"/api/v1/groups/{group['id']}").json()["members"] if m["endpoint"] == "/a")
@@ -227,6 +242,7 @@ def test_detach_member_leaves_group_intact_and_rule_becomes_standalone():
 
 def test_delete_group_detach_mode_keeps_member_rules_standalone():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         group = _create_group(client, members=[{"endpoint": "/a"}])
         rule_id = client.get(f"/api/v1/groups/{group['id']}").json()["members"][0]["rule_id"]
 
@@ -241,6 +257,7 @@ def test_delete_group_detach_mode_keeps_member_rules_standalone():
 
 def test_delete_group_delete_mode_removes_member_rules():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         group = _create_group(client, name="grp-delete-mode", members=[{"endpoint": "/a"}])
         rule_id = client.get(f"/api/v1/groups/{group['id']}").json()["members"][0]["rule_id"]
 
@@ -264,6 +281,7 @@ def test_check_on_member_endpoint_returns_effective_limit(monkeypatch):
     settings.reload()
 
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         _create_group(
             client,
             name="grp-effective-check",
@@ -277,6 +295,7 @@ def test_check_on_member_endpoint_returns_effective_limit(monkeypatch):
                 "endpoint": "/effective-check",
                 "identifiers": [{"type": "api_key", "value": "check-key-abc123"}],
             },
+            headers=check_auth_headers(),
         )
         assert response.status_code == 200
         assert response.json()["limit"] == 7
@@ -284,10 +303,12 @@ def test_check_on_member_endpoint_returns_effective_limit(monkeypatch):
 
 def test_create_standalone_rule_move_into_group_then_move_to_another_group():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         algorithm_id = _algorithm_id(client)
         rule = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/movable",
                 "identifier_types": ["ip"],
                 "algorithm_id": algorithm_id,
@@ -330,11 +351,13 @@ def test_create_standalone_rule_move_into_group_then_move_to_another_group():
 
 def test_move_to_group_conflicting_scope_is_rejected_and_writes_nothing():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         algorithm_id = _algorithm_id(client)
         # Standalone rule at /conflict-move for api_key.
         client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/conflict-move",
                 "identifier_types": ["api_key"],
                 "algorithm_id": algorithm_id,
@@ -347,6 +370,7 @@ def test_move_to_group_conflicting_scope_is_rejected_and_writes_nothing():
         rule_to_move = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/conflict-move",
                 "identifier_types": ["ip"],
                 "algorithm_id": algorithm_id,

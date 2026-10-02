@@ -16,6 +16,7 @@ def _rule(identifier_types: list[str] | None = None, **overrides) -> dict:
     }
     defaults = dict(
         id="rule-1",
+        client_pk="cp-1",
         endpoint="/checkout",
         identifier_types=sorted(identifier_types),
         identifier_signature="+".join(sorted(identifier_types)),
@@ -45,7 +46,7 @@ def test_load_all_populates_id_index_and_candidates():
     cache.load_all([rule])
 
     assert cache.get("rule-1") == rule
-    assert cache.get_candidates("/checkout") == [rule]
+    assert cache.get_candidates("cp-1", "/checkout") == [rule]
 
 
 def test_load_all_only_indexes_active_rules():
@@ -54,7 +55,7 @@ def test_load_all_only_indexes_active_rules():
     cache.load_all([rule])
 
     assert cache.get("rule-1") == rule  # still resolvable by id
-    assert cache.get_candidates("/checkout") == []
+    assert cache.get_candidates("cp-1", "/checkout") == []
 
 
 def test_load_all_excludes_unusable_rules_from_indexes():
@@ -68,7 +69,7 @@ def test_load_all_excludes_unusable_rules_from_indexes():
     cache.load_all([rule])
 
     assert cache.get("rule-1") == rule
-    assert cache.get_candidates("/checkout") == []
+    assert cache.get_candidates("cp-1", "/checkout") == []
 
 
 def test_load_all_is_a_full_replace_not_a_merge():
@@ -86,7 +87,7 @@ def test_upsert_adds_and_updates():
 
     cache.upsert(_rule())
     assert cache.get("rule-1") is not None
-    assert cache.get_candidates("/checkout") != []
+    assert cache.get_candidates("cp-1", "/checkout") != []
 
     cache.upsert(_rule(priority=50))
     assert cache.get("rule-1")["priority"] == 50
@@ -98,7 +99,7 @@ def test_upsert_with_inactive_status_removes_from_candidates():
 
     cache.upsert(_rule(status="inactive"))
     assert cache.get("rule-1")["status"] == "inactive"
-    assert cache.get_candidates("/checkout") == []
+    assert cache.get_candidates("cp-1", "/checkout") == []
 
 
 def test_remove_deletes_from_both_indexes():
@@ -107,7 +108,7 @@ def test_remove_deletes_from_both_indexes():
 
     cache.remove("rule-1")
     assert cache.get("rule-1") is None
-    assert cache.get_candidates("/checkout") == []
+    assert cache.get_candidates("cp-1", "/checkout") == []
 
 
 def test_remove_of_unknown_id_is_a_no_op():
@@ -123,8 +124,8 @@ def test_global_rule_is_kept_separate_from_candidates():
     global_rule = _rule(id="g1", identifier_types=["global"])
     cache.load_all([global_rule])
 
-    assert cache.get_global("/checkout") == global_rule
-    assert cache.get_candidates("/checkout") == []
+    assert cache.get_global("cp-1", "/checkout") == global_rule
+    assert cache.get_candidates("cp-1", "/checkout") == []
 
 
 def test_candidates_are_sorted_most_specific_first():
@@ -133,7 +134,7 @@ def test_candidates_are_sorted_most_specific_first():
     cache = RulesCache()
     cache.load_all([single, composite])
 
-    candidates = cache.get_candidates("/checkout")
+    candidates = cache.get_candidates("cp-1", "/checkout")
     assert [c["id"] for c in candidates] == ["composite", "single"]
 
 
@@ -143,7 +144,7 @@ def test_candidates_of_equal_specificity_break_ties_by_priority_desc():
     cache = RulesCache()
     cache.load_all([low_priority, high_priority])
 
-    candidates = cache.get_candidates("/checkout")
+    candidates = cache.get_candidates("cp-1", "/checkout")
     assert [c["id"] for c in candidates] == ["high", "low"]
 
 

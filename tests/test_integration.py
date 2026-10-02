@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 from core.settings import settings
 from main import app
-from tests.conftest import get_test_redis_url
+from tests.conftest import check_auth_headers, get_test_redis_url
 
 
 def test_check_allows_then_blocks_with_retry_after(tmp_path, monkeypatch):
@@ -29,17 +29,18 @@ def test_check_allows_then_blocks_with_retry_after(tmp_path, monkeypatch):
         "endpoint": "/api/v1/orders",
     }
 
+    headers = check_auth_headers()
     with TestClient(app) as client:
-        first = client.post("/api/v1/check", json=payload)
+        first = client.post("/api/v1/check", json=payload, headers=headers)
         assert first.status_code == 200
         first_body = first.json()
         assert first_body["allowed"] is True
         assert first_body["limit"] == 2
 
-        second = client.post("/api/v1/check", json=payload)
+        second = client.post("/api/v1/check", json=payload, headers=headers)
         assert second.json()["allowed"] is True
 
-        third = client.post("/api/v1/check", json=payload)
+        third = client.post("/api/v1/check", json=payload, headers=headers)
         body = third.json()
         assert third.status_code == 200
         assert body["allowed"] is False
@@ -54,7 +55,9 @@ def test_check_rejects_missing_fields(monkeypatch):
     settings.reload()
     with TestClient(app) as client:
         response = client.post(
-            "/api/v1/check", json={"identifiers": [{"type": "client_id", "value": "alice"}]}
+            "/api/v1/check",
+            json={"identifiers": [{"type": "client_id", "value": "alice"}]},
+            headers=check_auth_headers(),
         )
     assert response.status_code == 422
 
@@ -69,7 +72,7 @@ def test_health_returns_ok(monkeypatch):
 
 
 def test_unhandled_exception_returns_generic_500(monkeypatch):
-    async def _boom(self, payload):
+    async def _boom(self, client_pk, payload):
         raise RuntimeError("something exploded")
 
     monkeypatch.setattr(
@@ -82,6 +85,7 @@ def test_unhandled_exception_returns_generic_500(monkeypatch):
         response = client.post(
             "/api/v1/check",
             json={"identifiers": [{"type": "client_id", "value": "alice"}], "endpoint": "/api/v1/orders"},
+            headers=check_auth_headers(),
         )
 
     assert response.status_code == 500

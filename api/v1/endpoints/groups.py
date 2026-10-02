@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Query, status
 from fastapi.responses import JSONResponse
 
 from core.dependencies import get_rule_group_service
+from core.security.auth_dependency import require_scope
 from dto.rule_group_dto import (
     AddMembersRequestDTO,
     RuleGroupCreateRequestDTO,
@@ -17,23 +18,26 @@ from dto.rule_group_dto import (
     RuleGroupListResponse,
     RuleGroupResponseDTO,
     RuleGroupUpdateRequestDTO,
+    build_rule_group_response,
 )
 from services.rule_group_service import RuleGroupService
 
-router = APIRouter(prefix="/groups")
+router = APIRouter(prefix="/groups", dependencies=[Depends(require_scope("admin"))])
 
 
 @router.get("", response_model=RuleGroupListResponse)
 async def list_groups(
+    client_id: str | None = Query(default=None),
     name: str | None = Query(default=None, alias="name_contains"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     service: RuleGroupService = Depends(get_rule_group_service),
 ) -> RuleGroupListResponse:
-    filters = RuleGroupFilter(name_contains=name, page=page, page_size=page_size)
+    client_pk = await service.resolve_client_pk(client_id) if client_id is not None else None
+    filters = RuleGroupFilter(client_pk=client_pk, name_contains=name, page=page, page_size=page_size)
     rows, total = await service.list_groups(filters)
     items = [
-        RuleGroupListItemDTO(**RuleGroupResponseDTO.model_validate(group).model_dump(), member_count=count)
+        RuleGroupListItemDTO(**build_rule_group_response(group).model_dump(), member_count=count)
         for group, count in rows
     ]
     return RuleGroupListResponse(items=items, page=page, page_size=page_size, total=total)
@@ -44,7 +48,7 @@ async def get_group(
     group_id: uuid.UUID, service: RuleGroupService = Depends(get_rule_group_service)
 ) -> RuleGroupDetailResponseDTO:
     group, members = await service.get_group_with_members(group_id)
-    return RuleGroupDetailResponseDTO(**RuleGroupResponseDTO.model_validate(group).model_dump(), members=members)
+    return RuleGroupDetailResponseDTO(**build_rule_group_response(group).model_dump(), members=members)
 
 
 @router.post("", response_model=RuleGroupResponseDTO, status_code=status.HTTP_201_CREATED)
@@ -52,7 +56,7 @@ async def create_group(
     payload: RuleGroupCreateRequestDTO, service: RuleGroupService = Depends(get_rule_group_service)
 ) -> RuleGroupResponseDTO:
     group = await service.create_group(payload)
-    return RuleGroupResponseDTO.model_validate(group)
+    return build_rule_group_response(group)
 
 
 @router.patch("/{group_id}", response_model=RuleGroupResponseDTO)
@@ -62,7 +66,7 @@ async def update_group(
     service: RuleGroupService = Depends(get_rule_group_service),
 ) -> RuleGroupResponseDTO:
     group = await service.update_group(group_id, payload)
-    return RuleGroupResponseDTO.model_validate(group)
+    return build_rule_group_response(group)
 
 
 @router.delete("/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
