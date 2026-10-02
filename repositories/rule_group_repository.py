@@ -38,7 +38,7 @@ class RuleGroupRepository:
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
-    async def list(self, name_contains: str | None, page: int, page_size: int) -> tuple[list[tuple[RuleGroup, int]], int]:
+    async def list_groups(self, name_contains: str | None, page: int, page_size: int) -> tuple[list[tuple[RuleGroup, int]], int]:
         """Returns `([(group, member_count), ...], total)`."""
         member_count_subq = (
             select(Rule.group_id, func.count().label("member_count")).group_by(Rule.group_id).subquery()

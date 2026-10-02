@@ -84,7 +84,7 @@ class RuleGroupService:
         return group, members
 
     async def list_groups(self, filters: RuleGroupFilter) -> tuple[list[tuple[RuleGroup, int]], int]:
-        return await self._groups.list(filters.name_contains, filters.page, filters.page_size)
+        return await self._groups.list_groups(filters.name_contains, filters.page, filters.page_size)
 
     # -- create ------------------------------------------------------------
 
