@@ -18,6 +18,7 @@ _IDENTIFIER_HASH_SECRET_MIN_LENGTH = 32
 _AUTH_JWT_SIGNING_KEY_MIN_LENGTH = 32
 _DEFAULT_AUTH_TOKEN_TTL_SECONDS = 600
 _DEFAULT_CLIENTS_POLL_INTERVAL_SECONDS = 60
+_DEFAULT_CORS_ALLOWED_ORIGINS = "*"
 
 
 class Settings:
@@ -56,6 +57,21 @@ class Settings:
         self._clients_poll_interval_seconds = int(
             os.getenv("CLIENTS_POLL_INTERVAL_SECONDS", _DEFAULT_CLIENTS_POLL_INTERVAL_SECONDS)
         )
+        self._cors_allowed_origins = self._read_cors_allowed_origins()
+
+    @staticmethod
+    def _read_cors_allowed_origins() -> list[str]:
+        """`CORS_ALLOWED_ORIGINS` is a comma-separated list of origins (e.g.
+        `https://app.example.com,https://admin.example.com`), or `*` (the
+        default) to allow any origin — fine for a bearer-token API (no
+        cookies involved, so there's no CSRF-via-credentialed-CORS risk the
+        way there would be for a cookie-authenticated one), but a deployed
+        env should narrow this to the frontend's real origin(s).
+        """
+        raw = os.getenv("CORS_ALLOWED_ORIGINS", _DEFAULT_CORS_ALLOWED_ORIGINS)
+        if raw == "*":
+            return ["*"]
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
     @staticmethod
     def _read_identifier_hash_secret() -> str:
@@ -189,6 +205,12 @@ class Settings:
         takes effect for already-issued tokens.
         """
         return self._clients_poll_interval_seconds
+
+    def get_cors_allowed_origins(self) -> list[str]:
+        """`["*"]` (default) or an explicit origin allowlist. See
+        `_read_cors_allowed_origins`.
+        """
+        return self._cors_allowed_origins
 
 
 settings = Settings()

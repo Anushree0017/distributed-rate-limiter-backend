@@ -162,7 +162,17 @@ api/v1/endpoints/redis_health.py       GET /api/v1/redis/health — Redis diagno
 api/health.py                          GET /health — liveness + a single Redis PING
                                         (redis_connected: bool); kept cheap for tight-interval
                                         polling, unlike /redis/health
-main.py                                Calls setup_logging(), builds the Redis pool and hard-fails
+main.py                                `CORSMiddleware` is registered right after app construction
+                                        (before any router), origins from
+                                        `core/settings.py`'s `get_cors_allowed_origins()`
+                                        (`CORS_ALLOWED_ORIGINS` env var, default `*`) — lets the
+                                        separate `frontend/` origin call this API directly from a
+                                        browser once deployed. `allow_credentials` is left `False`
+                                        (the default): auth here is bearer-token, not cookie-based,
+                                        so a wildcard origin carries no CSRF/credentialed-CORS risk,
+                                        and `allow_origins=["*"]` + `allow_credentials=True` is
+                                        rejected by browsers outright anyway. Calls
+                                        setup_logging(), builds the Redis pool and hard-fails
                                         boot if PING fails, loads config, loads the RulesCache
                                         from Postgres (hard-fails boot if that fetch raises),
                                         builds RateLimiterService with that cache, starts the
