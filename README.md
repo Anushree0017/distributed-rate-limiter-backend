@@ -268,6 +268,18 @@ new ones with that secret.
 service itself doesn't terminate TLS (that's the gateway/load balancer's job), so plain-HTTP is
 only acceptable inside a trusted local/dev network.
 
+## CORS
+
+The API is callable directly from a browser (e.g. the `frontend/` admin UI). `CORS_ALLOWED_ORIGINS`
+(comma-separated, default `*`) controls which origins may call it; `*` is safe by default here
+because auth is bearer-token-based, not cookie-based, so there's no credentialed-CORS/CSRF
+exposure the way there would be for a cookie-authenticated API. For a deployed environment, narrow
+this to the frontend's real origin(s):
+
+```bash
+CORS_ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
+```
+
 ## API
 
 ### `GET /health`

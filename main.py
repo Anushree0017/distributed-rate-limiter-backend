@@ -3,6 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.health import router as health_router
@@ -112,6 +113,21 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Rate Limiter Service", lifespan=lifespan)
+# Allows the frontend (a separate origin once deployed) to call this API
+# directly from the browser. `allow_origins=["*"]` is safe here specifically
+# because auth is bearer-token-based, not cookie-based — there's no session
+# cookie for a malicious origin to ride along via CORS-permitted credentialed
+# requests. `allow_credentials` is deliberately left `False` (the default):
+# browsers reject `allow_origins=["*"]` combined with `allow_credentials=True`
+# outright, and nothing here uses cookies anyway. Narrow via
+# `CORS_ALLOWED_ORIGINS` (comma-separated) in a deployed env that wants to
+# restrict this to the frontend's real origin(s) — see core/settings.py.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=env_settings.get_cors_allowed_origins(),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(rate_limit.router, prefix="/api/v1")
 app.include_router(redis_health.router, prefix="/api/v1")
