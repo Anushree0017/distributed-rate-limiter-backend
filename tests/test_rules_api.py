@@ -10,12 +10,14 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from core.settings import settings
 from main import app
-from tests.conftest import get_test_database_url, get_test_redis_url
+from tests.conftest import admin_auth_headers, get_test_database_url, get_test_redis_url
 
 # `DATABASE_URL` -> scratch DB and per-test engine freshness are handled by
 # conftest.py's session-wide autouse fixtures now (needed by every test that
 # boots the app, not just this file). This file only needs REDIS_URL set and
 # `rules`/`rule_history` truncated between tests.
+
+_HEADERS = admin_auth_headers()
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -32,12 +34,12 @@ async def _point_app_at_test_redis_and_clean_up(monkeypatch):
 
 
 def _get_algorithm_id(client: TestClient) -> str:
-    return client.get("/api/v1/algorithms").json()[0]["id"]
+    return client.get("/api/v1/algorithms", headers=_HEADERS).json()[0]["id"]
 
 
 def test_identifiers_endpoint_returns_the_static_enum():
     with TestClient(app) as client:
-        response = client.get("/api/v1/rules/identifiers")
+        response = client.get("/api/v1/rules/identifiers", headers=_HEADERS)
     assert response.status_code == 200
     assert "global" in response.json()["identifier_types"]
     assert "user_id" in response.json()["identifier_types"]
@@ -45,7 +47,7 @@ def test_identifiers_endpoint_returns_the_static_enum():
 
 def test_algorithms_endpoint_lists_seeded_algorithms():
     with TestClient(app) as client:
-        response = client.get("/api/v1/algorithms")
+        response = client.get("/api/v1/algorithms", headers=_HEADERS)
     assert response.status_code == 200
     names = {a["name"] for a in response.json()}
     assert "TokenBucket" in names
@@ -58,52 +60,57 @@ def test_create_get_update_delete_rule_round_trip():
         create_response = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/checkout",
                 "identifier_types": ["user_id"],
                 "algorithm_id": algorithm_id,
                 "params": {"limit": 100, "window_seconds": 60},
                 "created_by": "jane.doe",
             },
+            headers=_HEADERS,
         )
         assert create_response.status_code == 201
         rule = create_response.json()
         assert rule["version"] == 1
         assert rule["status"] == "active"
         assert rule["algorithm"]["id"] == algorithm_id
+        assert rule["client_id"] == "default"
 
-        get_response = client.get(f"/api/v1/rules/{rule['id']}")
+        get_response = client.get(f"/api/v1/rules/{rule['id']}", headers=_HEADERS)
         assert get_response.status_code == 200
         assert get_response.json()["endpoint"] == "/checkout"
 
         update_response = client.patch(
             f"/api/v1/rules/{rule['id']}",
             json={"priority": 50, "updated_by": "jane.doe", "expected_version": 1},
+            headers=_HEADERS,
         )
         assert update_response.status_code == 200
         updated = update_response.json()
         assert updated["priority"] == 50
         assert updated["version"] == 2
 
-        delete_response = client.delete(f"/api/v1/rules/{rule['id']}")
+        delete_response = client.delete(f"/api/v1/rules/{rule['id']}", headers=_HEADERS)
         assert delete_response.status_code == 204
 
-        assert client.get(f"/api/v1/rules/{rule['id']}").status_code == 404
+        assert client.get(f"/api/v1/rules/{rule['id']}", headers=_HEADERS).status_code == 404
 
 
 def test_create_conflicting_scope_returns_409():
     with TestClient(app) as client:
         algorithm_id = _get_algorithm_id(client)
         body = {
+            "client_id": "default",
             "endpoint": "/orders",
             "identifier_types": ["user_id"],
             "algorithm_id": algorithm_id,
             "params": {"limit": 100, "window_seconds": 60},
             "created_by": "jane.doe",
         }
-        first = client.post("/api/v1/rules", json=body)
+        first = client.post("/api/v1/rules", json=body, headers=_HEADERS)
         assert first.status_code == 201
 
-        second = client.post("/api/v1/rules", json=body)
+        second = client.post("/api/v1/rules", json=body, headers=_HEADERS)
         assert second.status_code == 409
         assert second.json()["error"]["code"] == "SCOPE_CONFLICT"
 
@@ -113,19 +120,40 @@ def test_create_unknown_algorithm_returns_422():
         response = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/orders",
                 "identifier_types": ["global"],
                 "algorithm_id": "00000000-0000-0000-0000-000000000000",
                 "created_by": "jane.doe",
             },
+            headers=_HEADERS,
         )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "ALGORITHM_NOT_FOUND"
 
 
+def test_create_unknown_client_returns_404():
+    with TestClient(app) as client:
+        algorithm_id = _get_algorithm_id(client)
+        response = client.post(
+            "/api/v1/rules",
+            json={
+                "client_id": "no-such-client",
+                "endpoint": "/orders",
+                "identifier_types": ["global"],
+                "algorithm_id": algorithm_id,
+                "params": {"limit": 100, "window_seconds": 60},
+                "created_by": "jane.doe",
+            },
+            headers=_HEADERS,
+        )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "CLIENT_NOT_FOUND"
+
+
 def test_get_missing_rule_returns_404():
     with TestClient(app) as client:
-        response = client.get("/api/v1/rules/00000000-0000-0000-0000-000000000000")
+        response = client.get("/api/v1/rules/00000000-0000-0000-0000-000000000000", headers=_HEADERS)
     assert response.status_code == 404
 
 
@@ -135,18 +163,21 @@ def test_update_version_mismatch_returns_409():
         create_response = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/orders",
                 "identifier_types": ["global"],
                 "algorithm_id": algorithm_id,
                 "params": {"limit": 100, "window_seconds": 60},
                 "created_by": "jane.doe",
             },
+            headers=_HEADERS,
         )
         rule_id = create_response.json()["id"]
 
         response = client.patch(
             f"/api/v1/rules/{rule_id}",
             json={"priority": 1, "updated_by": "jane.doe", "expected_version": 99},
+            headers=_HEADERS,
         )
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "VERSION_CONFLICT"
@@ -159,15 +190,17 @@ def test_list_rules_paginates():
             client.post(
                 "/api/v1/rules",
                 json={
+                    "client_id": "default",
                     "endpoint": f"/list-endpoint-{i}",
                     "identifier_types": ["global"],
                     "algorithm_id": algorithm_id,
                     "params": {"limit": 100, "window_seconds": 60},
                     "created_by": "jane.doe",
                 },
+                headers=_HEADERS,
             )
 
-        response = client.get("/api/v1/rules", params={"page": 1, "page_size": 2})
+        response = client.get("/api/v1/rules", params={"page": 1, "page_size": 2}, headers=_HEADERS)
     assert response.status_code == 200
     body = response.json()
     assert body["total"] >= 3
@@ -180,12 +213,14 @@ def test_create_rule_with_composite_identifier_types():
         response = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/composite-endpoint",
                 "identifier_types": ["ip", "api_key"],
                 "algorithm_id": algorithm_id,
                 "params": {"limit": 100, "window_seconds": 60},
                 "created_by": "jane.doe",
             },
+            headers=_HEADERS,
         )
     assert response.status_code == 201
     rule = response.json()
@@ -200,12 +235,14 @@ def test_create_rule_rejects_too_many_identifier_types():
         response = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/composite-endpoint",
                 "identifier_types": ["ip", "api_key", "user_id", "session_id"],
                 "algorithm_id": algorithm_id,
                 "params": {"limit": 100, "window_seconds": 60},
                 "created_by": "jane.doe",
             },
+            headers=_HEADERS,
         )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "INVALID_IDENTIFIER_TYPES"
@@ -217,12 +254,14 @@ def test_create_rule_rejects_global_combined_with_another_type():
         response = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/composite-endpoint",
                 "identifier_types": ["global", "api_key"],
                 "algorithm_id": algorithm_id,
                 "params": {"limit": 100, "window_seconds": 60},
                 "created_by": "jane.doe",
             },
+            headers=_HEADERS,
         )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "INVALID_IDENTIFIER_TYPES"
@@ -234,12 +273,14 @@ def test_create_rule_rejects_params_that_dont_fit_the_algorithm():
         response = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/bad-params-endpoint",
                 "identifier_types": ["global"],
                 "algorithm_id": algorithm_id,
                 "params": {"totally": "wrong"},
                 "created_by": "jane.doe",
             },
+            headers=_HEADERS,
         )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "INVALID_RULE_PARAMS"
@@ -254,22 +295,41 @@ def test_composite_and_single_type_rules_coexist_on_the_same_endpoint():
         single = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/shared-endpoint",
                 "identifier_types": ["api_key"],
                 "algorithm_id": algorithm_id,
                 "params": {"limit": 100, "window_seconds": 60},
                 "created_by": "jane.doe",
             },
+            headers=_HEADERS,
         )
         composite = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/shared-endpoint",
                 "identifier_types": ["api_key", "ip"],
                 "algorithm_id": algorithm_id,
                 "params": {"limit": 50, "window_seconds": 60},
                 "created_by": "jane.doe",
             },
+            headers=_HEADERS,
         )
     assert single.status_code == 201
     assert composite.status_code == 201
+
+
+def test_rules_endpoints_reject_unauthenticated_requests():
+    with TestClient(app) as client:
+        response = client.get("/api/v1/rules")
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_rules_endpoints_reject_check_scoped_token():
+    from tests.conftest import check_auth_headers
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/rules", headers=check_auth_headers())
+    assert response.status_code == 403

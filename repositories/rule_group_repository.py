@@ -25,26 +25,35 @@ class RuleGroupRepository:
         self._session.add(group)
 
     async def get_by_id(self, group_id: uuid.UUID, for_update: bool = False) -> RuleGroup | None:
-        stmt = select(RuleGroup).where(RuleGroup.id == group_id).options(selectinload(RuleGroup.algorithm))
+        stmt = select(RuleGroup).where(RuleGroup.id == group_id).options(selectinload(RuleGroup.algorithm), selectinload(RuleGroup.client))
         if for_update:
             stmt = stmt.with_for_update()
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
-    async def get_by_name_ci(self, name: str, exclude_id: uuid.UUID | None = None) -> RuleGroup | None:
-        stmt = select(RuleGroup).where(func.lower(RuleGroup.name) == name.lower())
+    async def get_by_name_ci(
+        self, client_pk: uuid.UUID, name: str, exclude_id: uuid.UUID | None = None
+    ) -> RuleGroup | None:
+        """Scoped to `client_pk` (Phase 6): name uniqueness is
+        case-insensitive *per client* — see `ux_rule_groups_name_ci`.
+        """
+        stmt = select(RuleGroup).where(RuleGroup.client_id == client_pk, func.lower(RuleGroup.name) == name.lower())
         if exclude_id is not None:
             stmt = stmt.where(RuleGroup.id != exclude_id)
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
-    async def list_groups(self, name_contains: str | None, page: int, page_size: int) -> tuple[list[tuple[RuleGroup, int]], int]:
+    async def list_groups(
+        self, client_pk: uuid.UUID | None, name_contains: str | None, page: int, page_size: int
+    ) -> tuple[list[tuple[RuleGroup, int]], int]:
         """Returns `([(group, member_count), ...], total)`."""
         member_count_subq = (
             select(Rule.group_id, func.count().label("member_count")).group_by(Rule.group_id).subquery()
         )
 
         base_filter = []
+        if client_pk is not None:
+            base_filter.append(RuleGroup.client_id == client_pk)
         if name_contains is not None:
             base_filter.append(func.lower(RuleGroup.name).contains(name_contains.lower()))
 
@@ -56,7 +65,7 @@ class RuleGroupRepository:
         stmt = (
             select(RuleGroup, func.coalesce(member_count_subq.c.member_count, 0))
             .outerjoin(member_count_subq, RuleGroup.id == member_count_subq.c.group_id)
-            .options(selectinload(RuleGroup.algorithm))
+            .options(selectinload(RuleGroup.algorithm), selectinload(RuleGroup.client))
         )
         for clause in base_filter:
             stmt = stmt.where(clause)

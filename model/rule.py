@@ -14,6 +14,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from core.db import Base
 from model.algorithm import Algorithm
+from model.client import Client
 from model.rule_status import RuleStatus
 
 
@@ -22,6 +23,14 @@ class Rule(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    # Phase 6: every rule belongs to exactly one client. `ON DELETE RESTRICT`
+    # — a client can't be hard-deleted while it still owns rules (disable it
+    # instead, per the plan's explicit out-of-scope). Part of the uniqueness
+    # key alongside (endpoint, identifier_signature) — see
+    # ux_rules_active_scope in alembic/versions/0013_...py.
+    client_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("clients.id", ondelete="RESTRICT"), nullable=False
     )
     endpoint: Mapped[str] = mapped_column(String, nullable=False)
     # Canonical (deduplicated, alphabetically sorted) identifier types this
@@ -65,3 +74,8 @@ class Rule(Base):
     # Eagerly joined by the repository (`selectinload`) so `RuleResponseDTO` can
     # nest `{id, name}` without a second round-trip per row.
     algorithm: Mapped["Algorithm"] = relationship(lazy="raise")
+    # Also eagerly joined — `dto.rule_dto.build_rule_response` reads
+    # `.client.client_id` (the public slug) to populate the response's
+    # `client_id` field, since `Rule.client_id` the column is the internal
+    # FK/PK, not the slug.
+    client: Mapped["Client"] = relationship(lazy="raise")

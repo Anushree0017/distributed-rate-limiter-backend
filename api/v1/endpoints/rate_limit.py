@@ -10,6 +10,7 @@ incoming request/headers.
 from fastapi import APIRouter, Depends
 
 from core.dependencies import get_rate_limiter_service
+from core.security.auth_dependency import AuthenticatedClient, require_scope
 from dto.rate_limit_check_request import RateLimitCheckRequestDTO
 from model.rate_limit_result import RateLimitResult
 from services.rate_limiter_service import RateLimiterService
@@ -21,5 +22,6 @@ router = APIRouter()
 async def check_rate_limit(
     payload: RateLimitCheckRequestDTO,
     service: RateLimiterService = Depends(get_rate_limiter_service),
+    client: AuthenticatedClient = Depends(require_scope("check")),
 ) -> RateLimitResult:
-    return await service.check_rate_limit(payload)
+    return await service.check_rate_limit(client.pk, payload)

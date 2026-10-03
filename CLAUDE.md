@@ -16,7 +16,30 @@ eviction, standardized response fields), Improvisation 2 (non-positive config va
 integration)**, **Phase 3 (rules CRUD service)**, **Phase 3 Part 2 (rules cache + polling,
 wired into `/check`)**, a clean-code pass removing `rules.identifier_value` (see "Deviations
 from the identifier_value-removal change" below), **Phase 5 Part 1 (composite
-identifiers)**, and **Phase 5 Part 2 (endpoint groups)** are all **fully implemented**.
+identifiers)**, **Phase 5 Part 2 (endpoint groups)**, and **Phase 6 Steps 1-9 (service auth +
+multi-client)** are all **fully implemented**.
+
+**Phase 6 (service auth + multi-client), Steps 1-9** adds OAuth2 client-credentials
+authentication and multi-tenant isolation, per `.claude/plans/phase6/plan.md`. Every caller is a
+registered **client** (`clients` table); a client exchanges `client_id`+`client_secret` at
+`POST /api/v1/auth/token` for a short-lived signed JWT (HS256, keyring-based, default TTL 600s),
+sent as `Authorization: Bearer` on every subsequent call. Verification is purely local —
+signature/claims check (`core/security/tokens.py`) plus an in-memory `ClientsCache` lookup
+(`services/clients_cache.py`, polled every `CLIENTS_POLL_INTERVAL_SECONDS`, default 60s) — so
+`/check` and every other protected endpoint pay zero extra DB/Redis round trips for auth.
+`core/security/auth_dependency.py`'s `require_scope(scope)` FastAPI dependency enforces this; the
+data plane (`POST /check`) needs scope `check`, the admin plane (rules, groups, clients,
+algorithms, scripts, redis/health) needs scope `admin`. Every rule and group now belongs to
+exactly one client (`rules.client_id`/`rule_groups.client_id`), and `/check` resolution
+(`RulesCache`, `RateLimiterService`) runs entirely inside the authenticated caller's client
+namespace — two clients can expose the same endpoint, with the same caller-presented identifier
+values, and never share Redis state, including the static YAML default (now scoped
+`client:{client_pk}:__default__`). Bootstrap: `scripts/create_client.py` creates the first admin
+client directly against Postgres (the clients admin API itself needs an admin token to call).
+**Steps 10-11 of the plan (Lambda handler, Locust, remote tests, simulator, deploy
+scripts/env, and most of the docs bullet) were explicitly out of scope for this pass** — see
+"Deviations from the Phase 6 plan" below. The real API gateway and `load-test/` still send
+unauthenticated requests and will get `401`s against a backend with this phase deployed.
 
 **Phase 5 Part 2** adds `POST/GET/PATCH/DELETE /api/v1/groups` + `POST /api/v1/groups/{id}/members`
 (pure addition) + `PATCH /api/v1/rules/{id}/detach` + `POST /api/v1/rules/{id}/move-to-group`. A
@@ -139,7 +162,17 @@ api/v1/endpoints/redis_health.py       GET /api/v1/redis/health — Redis diagno
 api/health.py                          GET /health — liveness + a single Redis PING
                                         (redis_connected: bool); kept cheap for tight-interval
                                         polling, unlike /redis/health
-main.py                                Calls setup_logging(), builds the Redis pool and hard-fails
+main.py                                `CORSMiddleware` is registered right after app construction
+                                        (before any router), origins from
+                                        `core/settings.py`'s `get_cors_allowed_origins()`
+                                        (`CORS_ALLOWED_ORIGINS` env var, default `*`) — lets the
+                                        separate `frontend/` origin call this API directly from a
+                                        browser once deployed. `allow_credentials` is left `False`
+                                        (the default): auth here is bearer-token, not cookie-based,
+                                        so a wildcard origin carries no CSRF/credentialed-CORS risk,
+                                        and `allow_origins=["*"]` + `allow_credentials=True` is
+                                        rejected by browsers outright anyway. Calls
+                                        setup_logging(), builds the Redis pool and hard-fails
                                         boot if PING fails, loads config, loads the RulesCache
                                         from Postgres (hard-fails boot if that fetch raises),
                                         builds RateLimiterService with that cache, starts the
@@ -468,6 +501,92 @@ core/exceptions.py                     New: `RuleGroupNotFoundError` (404), `Gro
                                         `MembersWriteRaceError` (409 backstop for a racing
                                         unique-constraint violation slipping past the diff-based
                                         pre-check)
+
+--- Phase 6 (service auth + multi-client), Steps 1-9 ---
+model/client.py, model/client_status.py  `Client` ORM model (`clients` table) — `client_id` (public
+                                        slug, unique, immutable, the JWT `sub`), `name`,
+                                        `description`, `status` (`ClientStatus`: active/disabled),
+                                        `scopes TEXT[]` (subset of `{check, admin}`)
+model/client_secret.py                 `ClientSecret` ORM model (`client_secrets` table) —
+                                        `client_pk` FK (`ON DELETE RESTRICT`), `secret_hash`
+                                        (SHA-256, never the plaintext), `secret_hint` (last 4
+                                        chars), `expires_at`/`revoked_at` (both nullable)
+model/rule.py, model/rule_group.py     Gained `client_id UUID NOT NULL` (FK `clients.id`,
+                                        `ON DELETE RESTRICT`) + a `client` relationship
+                                        (`lazy="raise"`, eager-loaded alongside `algorithm`
+                                        wherever that already was). `ux_rules_active_scope` is now
+                                        `UNIQUE (client_id, endpoint, identifier_signature) WHERE
+                                        status='active'`; `ux_rule_groups_name_ci` is now
+                                        `(client_id, lower(name))`
+core/security/secrets.py               `generate_secret()` (`secrets.token_urlsafe(32)`),
+                                        `hash_secret()` (plain SHA-256 — see its docstring for why
+                                        not bcrypt), `secret_hint()`, `verify_secret()`
+                                        (`hmac.compare_digest`)
+core/security/tokens.py                `TokenService.issue(client_id, scopes)` /
+                                        `.verify(token) -> TokenClaims`, HS256 + keyring
+                                        (`AUTH_JWT_SIGNING_KEYS`/`AUTH_JWT_ACTIVE_KID`), pins
+                                        `algorithms=["HS256"]`, requires every claim in
+                                        `exp,iat,iss,aud,sub,jti,scope`, 30s leeway. One `TokenError`
+                                        for every verification failure reason (never echoed
+                                        verbatim to callers). Built once at app startup, stored on
+                                        `app.state.token_service`
+core/security/auth_dependency.py       `require_scope(scope)` — the FastAPI dependency protecting
+                                        every non-`/health`/`/auth/token` endpoint. Verifies the
+                                        bearer token, looks `claims.client_id` up in `ClientsCache`,
+                                        intersects token scopes with the cache's *current* scopes,
+                                        returns an `AuthenticatedClient(pk, client_id, scopes)`. No
+                                        DB/Redis access — purely local verification + an in-memory
+                                        lookup
+services/clients_cache.py              `ClientsCache` — mirrors `RulesCache` exactly
+                                        (`threading.Lock` swap, full-replace `load_all`,
+                                        `get_by_client_id`/`get_by_pk`, `is_ready`/`stats`)
+services/clients_loader.py             `fetch_all_clients_from_db()` + `load_clients_into_cache()`
+                                        — mirrors `rules_loader.py`'s fetch+load primitive
+core/scheduler.py                      Gained a second job, `clients_poll`
+                                        (`CLIENTS_POLL_INTERVAL_SECONDS`, default 60s), same
+                                        log-and-continue-on-failure shape as `rules_poll`
+services/auth_service.py               `AuthService.issue_token(client_id, secret, scopes?)` — the
+                                        client-credentials grant's business logic: unknown client
+                                        (dummy hash compare for timing-oracle safety), wrong secret,
+                                        disabled client, expired/revoked secret all raise the same
+                                        `InvalidClientError`; a requested scope outside the client's
+                                        registered scopes raises `InvalidScopeError`
+services/client_service.py             Business rules for the clients admin API: create (+ mints
+                                        the first secret), update, add/list/revoke secrets (the
+                                        two-active-secrets cap, the last-active-secret-while-active
+                                        guard)
+repositories/client_repository.py      Dumb data access for `clients`/`client_secrets`
+api/v1/endpoints/auth.py               `POST /auth/token` — form fields or HTTP Basic, RFC 6749
+                                        error shapes (`invalid_request`/`invalid_client`/
+                                        `invalid_scope`)
+api/v1/endpoints/clients.py            `/clients*` admin endpoints (scope `admin`, via a
+                                        router-level `dependencies=[Depends(require_scope("admin"))]`
+                                        — the same pattern used to protect `rules.py`/`groups.py`/
+                                        `algorithms.py`/`scripts.py`/`redis_health.py`)
+scripts/create_client.py               Bootstrap CLI — direct DB access, no API, prints the first
+                                        admin client's secret once
+core/exceptions.py                     New: `InvalidRequestError`/`InvalidClientError`/
+                                        `InvalidScopeError` (RFC 6749 shapes, not the usual
+                                        envelope), `AuthenticationError` (401,
+                                        `WWW-Authenticate: Bearer`), `AuthorizationError` (403),
+                                        `ClientNotFoundError`/`ClientIdConflictError`/
+                                        `TooManyActiveSecretsError`/`LastActiveSecretError`/
+                                        `ClientSecretNotFoundError`, `CrossClientOperationError`
+                                        (409, `move_to_group` cross-client guard)
+services/rate_limiter_service.py       `check_rate_limit(client_pk, payload)` — `client_pk` comes
+                                        from the token via the endpoint's `require_scope("check")`
+                                        dependency, never the request body. `_resolve_rule` and the
+                                        static-default fallback (`_build_default_limiter`) both run
+                                        inside that client's namespace — see "Deviations" below for
+                                        the default-limiter scope decision
+services/rules_cache.py, services/rules_loader.py  Both indexes (`_candidates_by_scope`,
+                                        `_global_by_scope`) are now keyed by `(client_pk, endpoint)`
+                                        tuples, not bare `endpoint`; `_serialize_rule` adds
+                                        `client_pk`
+dto/rule_dto.py, dto/rule_group_dto.py `RuleCreateRequestDTO`/`RuleGroupCreateRequestDTO` gained a
+                                        required `client_id` (slug). `build_rule_response`/
+                                        `build_rule_group_response` replace bare `model_validate` —
+                                        see "Deviations" below
 ```
 
 ### Deviations from the Phase 5 Part 1 (composite identifiers) plan worth knowing about
@@ -599,6 +718,95 @@ core/exceptions.py                     New: `RuleGroupNotFoundError` (404), `Gro
   service layer** — `RuleGroupService.delete_group` always drains membership (detach or delete)
   *before* deleting the group row, so the DB's `ON DELETE RESTRICT` on `rules.group_id` is never
   actually hit in the normal path; it's a backstop for a bug, not part of the intended flow.
+
+### Deviations from the Phase 6 (service auth + multi-client) plan worth knowing about
+- **Scope of this pass was explicitly narrowed to Steps 1-9** (schema, crypto/settings,
+  `ClientsCache`+poller, token endpoint, auth dependency + protected endpoints, client-scoped
+  `/check` resolution, clients admin API + bootstrap CLI, client-scoping in rules/groups) — by
+  explicit user instruction. Steps 10-11 (`infra/terraform/lambda/handler.py`, `load-test/`,
+  `simulators/simulate_rate_limiter.py`, `deploy/.env`/`deploy-rate-limiter.sh`, and
+  `prd_architecture.md`) were **not touched**. The real gateway and load-test tooling will get
+  `401 UNAUTHORIZED` against any backend with this phase deployed until that follow-up work lands.
+- **Unknown #1 (how the YAML-default limiter is built/scoped) resolved by reading the code**: pre-
+  Phase-6, `RateLimiterService.__init__` built exactly **one** `_default_limiter` instance with the
+  literal scope `"__default__"`, reused for *every* endpoint that fell through to the static
+  config — i.e. one shared fallback bucket across all such endpoints, not one per endpoint. Phase 6
+  preserves that "one shared bucket" behavior, now partitioned **per client**: the limiter is built
+  fresh per request (cheap — no I/O, the script is already registered) with scope
+  `client:{client_pk}:__default__`, never cached by `(client, endpoint)` (that would be an
+  unbounded map keyed by request-supplied endpoint strings, the exact shape Step 7's "Unknowns"
+  note warned against). `RateLimiterService._build_default_limiter` and the `_DEFAULT_SCOPE_SUFFIX`
+  comment in `services/rate_limiter_service.py` record this.
+- **Endpoints not named in the plan's table (`/api/v1/scripts/reload`, `GET /api/v1/redis/health`)
+  were put behind `admin` scope anyway**, treated as part of the admin/operational plane rather
+  than left open — the plan's table only lists rules/groups/clients/algorithms explicitly but
+  doesn't mention these two at all; leaving diagnostic/operational actions unauthenticated while
+  everything else requires a token seemed like an oversight to preserve, not a deliberate choice to
+  keep.
+- **An unknown-to-`ClientsCache` or disabled-client token is treated as `403`, not `401`** — the
+  plan's endpoint table splits "missing/invalid/expired token" (401) from "insufficient scope or
+  disabled client" (403) but doesn't explicitly classify "cryptographically valid token whose `sub`
+  isn't in the cache at all" (e.g. the client row was never created, or was deleted — not offered,
+  but defensive). Treated as 403 (grouped with "disabled"): the token itself isn't the problem, the
+  caller just isn't currently authorized, consistent with the plan's revocation section listing
+  "sub missing from the cache" and "not active" together as the same rejection category.
+  `core/security/auth_dependency.py`'s `require_scope` docstring records this.
+- **`TokenService` is built once at app startup** (`main.py`'s lifespan, stored on `app.state`,
+  same pattern as `RateLimiterService`/`RulesCache`) rather than per-request — construction only
+  reads `settings` (no I/O), so there's no correctness reason to rebuild it, and building once
+  avoids re-parsing the signing keyring on every single request.
+- **`RuleResponseDTO`/`RuleGroupResponseDTO.client_id` required a non-`from_attributes` escape
+  hatch.** The ORM column `Rule.client_id`/`RuleGroup.client_id` is the internal FK (a `UUID`), but
+  the response field is the public slug (`str`) — and Pydantic v2's `str` type does **not** coerce
+  a `UUID` to `str` even in lax mode (raises `ValidationError` outright, it doesn't silently
+  stringify). `dto/rule_dto.py`'s `build_rule_response` / `dto/rule_group_dto.py`'s
+  `build_rule_group_response` build an explicit dict of every other field via `getattr` and
+  substitute `rule.client.client_id` (the eager-loaded relationship) for that one field, rather
+  than `model_validate(rule).model_copy(update=...)` (which still fails: the initial
+  `model_validate` pass sees the raw UUID before any copy/override can happen). Every repository
+  method that previously `selectinload`ed `Rule.algorithm`/`RuleGroup.algorithm` now also loads
+  `.client`, for the same reason `.algorithm` was eager-loaded (`lazy="raise"` on both
+  relationships).
+- **Admin-API tests mint tokens directly via `TokenService`, not through `POST /auth/token`.**
+  `tests/conftest.py` adds `admin_auth_headers()`/`check_auth_headers()` (plain functions, not
+  fixtures) that call `TokenService().issue(...)` straight — the protected-endpoint test files
+  (`test_rules_api.py`, `test_groups_api.py`, etc.) are testing *scope enforcement*, not the
+  client-credentials exchange itself (that's `test_security_tokens.py`'s and the token endpoint's
+  own job), so going through the full HTTP token exchange in every one of those files would be
+  redundant setup, not a more faithful test. A session-scoped autouse fixture
+  (`_seed_admin_test_client`) seeds one `test-admin-client` (scopes=`["admin"]`) once per test
+  session directly via the ORM; the pre-existing seeded `default` client (scopes=`["check"]`, from
+  migration 0012) doubles as the `check`-scope test client, so no second client was needed for
+  that side. `tests/conftest.py`'s `db_session` fixture's per-test cleanup was extended to preserve
+  both of these two rows (previously it only had `rule_groups`/`rule_history`/`rules` to truncate)
+  while still deleting anything else a test created under `clients`/`client_secrets` — the first
+  version of this cleanup deleted `test-admin-client` itself after the first `db_session`-based
+  test ran, since it only special-cased `default`; this was caught by running the full suite (not
+  just each file individually) and fixed before landing.
+- **`RuleFilter`/`RuleGroupFilter` gained `client_pk: UUID | None`, not `client_id: str | None`.**
+  The DTO itself stays client-PK-typed (internal, repository-ready); the controllers
+  (`api/v1/endpoints/rules.py`/`groups.py`) accept a `?client_id=<slug>` query param and resolve it
+  to a PK via a new `RuleService.resolve_client_pk`/`RuleGroupService.resolve_client_pk` method
+  before constructing the filter — keeping the slug-to-PK resolution in the service layer (where
+  `ClientRepository` access already lives for `create_rule`/`create_group`) rather than teaching
+  the controller to reach into a repository directly.
+- **A new `CrossClientOperationError` (409) guards `move_to_group`** — raised before any mutation
+  if the rule being moved and the target group belong to different clients (the group invariant
+  extended per Step 9: "a rule's `client_id` equals its group's `client_id`"). `add_members` and
+  `create_group`'s initial-members path don't need an equivalent check: new member rows are always
+  created with `client_id=group.client_id` directly, so there's no pre-existing rule with a
+  mismatched client to reject in the first place — only `move_to_group` moves an *existing* rule
+  (with its own, possibly different, `client_id`) into a group.
+- **`ClientsCache`/`services/clients_loader.py`/the `clients_poll` scheduler job mirror
+  `RulesCache`/`rules_loader.py`/`rules_poll` field-for-field** (same `threading.Lock`-swap,
+  full-replace-not-diff, log-and-continue-on-poll-failure, hard-fail-on-boot-failure design) —
+  no new design decisions were needed here; it's the same pattern applied to a second entity.
+- **`client_secrets` isn't truncated/cleaned up by any migration-adjacent seed step** — only
+  `clients` gets a seed row (`default`, via migration 0012); no secret is ever seeded for it, since
+  a seeded plaintext secret would have to live in a migration file (a real secret checked into
+  version control) or be unusable (a hash with no known plaintext). An operator issues `default`'s
+  first secret via `scripts/create_client.py`-style direct access or the admin API once Phase 6 is
+  live, same as any other client.
 
 ### Deviations from the original Phase 1/Improvisation spec worth knowing about
 - The `/check` request model lives in `dto/rate_limit_check_request.py`, not inlined in the

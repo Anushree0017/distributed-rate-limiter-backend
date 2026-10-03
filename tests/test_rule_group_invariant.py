@@ -14,10 +14,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from core.settings import settings
 from main import app
 from repositories.algorithm_repository import AlgorithmRepository
+from repositories.client_repository import ClientRepository
 from repositories.rule_group_repository import RuleGroupRepository
 from repositories.rule_repository import RuleRepository
 from services.rule_group_service import RuleGroupService
-from tests.conftest import get_test_database_url, get_test_redis_url
+from tests.conftest import admin_auth_headers, get_test_database_url, get_test_redis_url
+
+_HEADERS = admin_auth_headers()
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -49,10 +52,12 @@ def _assert_group_invariant(group: dict, members: list[dict]) -> None:
 
 def test_group_invariant_holds_after_create_patch_members_and_move():
     with TestClient(app) as client:
+        client.headers.update(_HEADERS)
         algorithm_id = _algorithm_id(client)
         create_response = client.post(
             "/api/v1/groups",
             json={
+                "client_id": "default",
                 "name": "grp-invariant",
                 "algorithm_id": algorithm_id,
                 "identifier_types": ["api_key"],
@@ -96,6 +101,7 @@ def test_group_invariant_holds_after_create_patch_members_and_move():
         rule = client.post(
             "/api/v1/rules",
             json={
+                "client_id": "default",
                 "endpoint": "/i-standalone",
                 "identifier_types": ["ip"],
                 "algorithm_id": algorithm_id,
@@ -132,7 +138,9 @@ async def test_two_overlapping_group_param_edits_end_in_a_consistent_state():
 
     async def _make_service():
         session = session_factory()
-        return session, RuleGroupService(RuleGroupRepository(session), RuleRepository(session), AlgorithmRepository(session))
+        return session, RuleGroupService(
+            RuleGroupRepository(session), RuleRepository(session), AlgorithmRepository(session), ClientRepository(session)
+        )
 
     setup_session, setup_service = await _make_service()
     try:
@@ -144,6 +152,7 @@ async def test_two_overlapping_group_param_edits_end_in_a_consistent_state():
 
         group = await setup_service.create_group(
             RuleGroupCreateRequestDTO(
+                client_id="default",
                 name="grp-concurrent",
                 algorithm_id=fixed_window.id,
                 identifier_types=["api_key"],

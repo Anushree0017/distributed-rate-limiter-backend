@@ -25,26 +25,30 @@ class RuleRepository:
         except IntegrityError:
             await self._session.rollback()
             raise
-        await self._session.refresh(rule, attribute_names=["algorithm"])
+        await self._session.refresh(rule, attribute_names=["algorithm", "client"])
         return rule
 
     async def get_by_id(self, rule_id: uuid.UUID) -> Rule | None:
         result = await self._session.execute(
-            select(Rule).where(Rule.id == rule_id).options(selectinload(Rule.algorithm))
+            select(Rule).where(Rule.id == rule_id).options(selectinload(Rule.algorithm), selectinload(Rule.client))
         )
         return result.scalar_one_or_none()
 
     async def find_active_conflict(
         self,
+        client_pk: uuid.UUID,
         endpoint: str,
         identifier_signature: str,
         exclude_id: uuid.UUID | None = None,
     ) -> Rule | None:
         """The service-layer pre-check backstopped by `ux_rules_active_scope`
         (see `db_schema.sql`) — lets the service return a specific 409 message
-        instead of surfacing a raw DB constraint violation.
+        instead of surfacing a raw DB constraint violation. Scoped to
+        `client_pk` (Phase 6): two clients may each hold an active rule for
+        the same `(endpoint, identifier_signature)` without conflicting.
         """
         stmt = select(Rule).where(
+            Rule.client_id == client_pk,
             Rule.endpoint == endpoint,
             Rule.identifier_signature == identifier_signature,
             Rule.status == RuleStatus.ACTIVE.value,
@@ -60,7 +64,7 @@ class RuleRepository:
         except IntegrityError:
             await self._session.rollback()
             raise
-        await self._session.refresh(rule, attribute_names=["algorithm"])
+        await self._session.refresh(rule, attribute_names=["algorithm", "client"])
         return rule
 
     async def delete(self, rule: Rule) -> None:
@@ -69,7 +73,7 @@ class RuleRepository:
 
     async def list_by_group(self, group_id: uuid.UUID) -> list[Rule]:
         result = await self._session.execute(
-            select(Rule).where(Rule.group_id == group_id).options(selectinload(Rule.algorithm))
+            select(Rule).where(Rule.group_id == group_id).options(selectinload(Rule.algorithm), selectinload(Rule.client))
         )
         return list(result.scalars().all())
 
@@ -93,13 +97,16 @@ class RuleRepository:
         it with an oversized `page_size`, so the cache-loading path can never
         silently truncate at whatever `page_size` cap the API enforces.
         """
-        result = await self._session.execute(select(Rule).options(selectinload(Rule.algorithm)))
+        result = await self._session.execute(select(Rule).options(selectinload(Rule.algorithm), selectinload(Rule.client)))
         return list(result.scalars().all())
 
     async def list(self, filters: RuleFilter) -> tuple[list[Rule], int]:
-        stmt = select(Rule).options(selectinload(Rule.algorithm))
+        stmt = select(Rule).options(selectinload(Rule.algorithm), selectinload(Rule.client))
         count_stmt = select(func.count()).select_from(Rule)
 
+        if filters.client_pk is not None:
+            stmt = stmt.where(Rule.client_id == filters.client_pk)
+            count_stmt = count_stmt.where(Rule.client_id == filters.client_pk)
         if filters.endpoint is not None:
             stmt = stmt.where(Rule.endpoint == filters.endpoint)
             count_stmt = count_stmt.where(Rule.endpoint == filters.endpoint)
